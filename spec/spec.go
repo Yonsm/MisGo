@@ -1,6 +1,10 @@
-package misgo
+// Package spec queries the public MIoT specification registry (miot-spec.org),
+// caches model indices and optional per-model instances, and formats readable
+// text or Python enum listings. It has no dependency on account or miio.
+package spec
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,31 +19,60 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 	"unicode"
 )
 
 const (
-	specRegistry = "https://miot-spec.org/miot-spec-v2"
-	specMaxSize  = 32 << 20
+	RegistryURL = "https://miot-spec.org/miot-spec-v2"
+	specMaxSize = 32 << 20
 )
 
-var (
-	specHTTP     = &http.Client{Timeout: 15 * time.Second}
-	defaultSpecs = &SpecClient{cachePath: filepath.Join(os.TempDir(), "miservice_miot_specs.json")}
-)
+// DefaultIndexCachePath returns the MiService-compatible temp-file cache path
+// for the full model-to-URN index.
+func DefaultIndexCachePath() string {
+	return filepath.Join(os.TempDir(), "miservice_miot_specs.json")
+}
 
-// SpecClient queries the public MIoT registry and caches its model index.
-// Its zero value uses the public registry with an in-memory cache.
-type SpecClient struct {
-	baseURL   string
-	http      *http.Client
-	cachePath string
+// Option configures a spec Client.
+type Option func(*Client)
 
-	mu      sync.Mutex
-	index   map[string]string
-	loading *specIndexLoad
+// WithBaseURL overrides the MIoT spec registry base URL.
+func WithBaseURL(baseURL string) Option {
+	return func(c *Client) { c.baseURL = strings.TrimRight(baseURL, "/") }
+}
+
+// WithHTTPClient sets the HTTP client used for registry requests.
+func WithHTTPClient(client *http.Client) Option {
+	return func(c *Client) { c.http = client }
+}
+
+// WithIndexCache enables disk caching of the model-to-URN index at path.
+func WithIndexCache(path string) Option {
+	return func(c *Client) { c.indexCachePath = path }
+}
+
+// WithInstanceCache enables disk caching of individual model spec JSON documents at path.
+func WithInstanceCache(path string) Option {
+	return func(c *Client) { c.instanceCachePath = path }
+}
+
+// Client queries the public MIoT registry and caches its model index and
+// optional per-model instances. Its zero value uses the public registry with
+// an in-memory cache and a 15-second HTTP timeout.
+type Client struct {
+	baseURL           string
+	http              *http.Client
+	indexCachePath    string
+	instanceCachePath string
+
+	indexMu   sync.Mutex
+	index     map[string]string
+	indexLoad *specIndexLoad
+
+	instMu        sync.Mutex
+	instances     map[string]json.RawMessage
+	instanceLoads map[string]*specInstanceLoad
 }
 
 type specIndexLoad struct {
@@ -49,21 +82,107 @@ type specIndexLoad struct {
 	abandoned bool
 }
 
-// NewSpecClient creates a client with an isolated in-memory cache. An empty
-// baseURL selects the public registry; a nil client selects the default HTTP client.
-func NewSpecClient(baseURL string, client *http.Client) *SpecClient {
-	return &SpecClient{baseURL: strings.TrimRight(baseURL, "/"), http: client}
+type specInstanceLoad struct {
+	done chan struct{}
+	raw  json.RawMessage
+	err  error
 }
 
-// Spec looks up a device by model, model substring, or type URN in the public registry.
-// It returns a model-to-URN map for zero or multiple matches. A unique instance is
-// returned as raw JSON when format is empty, or as a text or Python enum listing.
-func Spec(ctx context.Context, model, format string) (any, error) {
-	return defaultSpecs.Spec(ctx, model, format)
+// New creates a spec Client with the given options.
+func New(options ...Option) *Client {
+	c := &Client{}
+	for _, opt := range options {
+		opt(c)
+	}
+	return c
 }
 
-// Spec looks up a device using this client's registry and index cache.
-func (s *SpecClient) Spec(ctx context.Context, model, format string) (any, error) {
+// Resolve looks up matching model-to-URN entries for keyword.
+func (s *Client) Resolve(ctx context.Context, keyword string) (map[string]string, error) {
+	return s.matchModels(ctx, keyword)
+}
+
+// Raw returns the raw JSON for a unique model/URN instance (using the optional
+// instance cache with per-model request deduplication), or a JSON-encoded map
+// of matching models when zero or multiple models match.
+func (s *Client) Raw(ctx context.Context, model string) (json.RawMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if model != "" && s.instanceCachePath != "" {
+		return s.rawCached(ctx, model)
+	}
+	raw, _, err := s.fetchRaw(ctx, model)
+	return raw, err
+}
+
+func (s *Client) rawCached(ctx context.Context, model string) (json.RawMessage, error) {
+	s.instMu.Lock()
+	if s.instances == nil {
+		s.instances = readJSONCache[json.RawMessage](s.instanceCachePath)
+	}
+	if cached := s.instances[model]; len(cached) > 0 && cached[0] == '{' {
+		s.instMu.Unlock()
+		return bytes.Clone(cached), nil
+	}
+	if s.instanceLoads == nil {
+		s.instanceLoads = make(map[string]*specInstanceLoad)
+	}
+	if pending := s.instanceLoads[model]; pending != nil {
+		s.instMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-pending.done:
+			return bytes.Clone(pending.raw), pending.err
+		}
+	}
+	pending := &specInstanceLoad{done: make(chan struct{})}
+	s.instanceLoads[model] = pending
+	s.instMu.Unlock()
+
+	raw, isInstance, err := s.fetchRaw(ctx, model)
+	s.instMu.Lock()
+	if err == nil && isInstance {
+		s.instances[model] = bytes.Clone(raw)
+		writeJSONCache(s.instanceCachePath, s.instances)
+	}
+	pending.raw, pending.err = raw, err
+	delete(s.instanceLoads, model)
+	close(pending.done)
+	s.instMu.Unlock()
+	return bytes.Clone(raw), err
+}
+
+func (s *Client) fetchRaw(ctx context.Context, model string) (json.RawMessage, bool, error) {
+	urn := model
+	if !strings.HasPrefix(model, "urn") {
+		matches, err := s.matchModels(ctx, model)
+		if err != nil {
+			return nil, false, err
+		}
+		if len(matches) != 1 {
+			raw, err := json.Marshal(matches)
+			return raw, false, err
+		}
+		for _, urn = range matches {
+		}
+	}
+	endpoint := "/instance?" + url.Values{"type": {urn}}.Encode()
+	var raw json.RawMessage
+	if err := s.fetch(ctx, endpoint, &raw); err != nil {
+		return nil, false, err
+	}
+	if len(raw) == 0 || raw[0] != '{' {
+		return nil, false, errors.New("MIoT spec instance is not a JSON object")
+	}
+	return raw, true, nil
+}
+
+// Spec looks up a device by model, model substring, or type URN.
+// It returns a model-to-URN map for zero or multiple matches. A unique instance
+// is returned as raw JSON when format is empty, or as a "text" or "python" listing.
+func (s *Client) Spec(ctx context.Context, model, format string) (any, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -79,13 +198,9 @@ func (s *SpecClient) Spec(ctx context.Context, model, format string) (any, error
 		for _, urn = range matches {
 		}
 	}
-	endpoint := "/instance?" + url.Values{"type": {urn}}.Encode()
-	var raw json.RawMessage
-	if err := s.fetch(ctx, endpoint, &raw); err != nil {
+	raw, err := s.Raw(ctx, urn)
+	if err != nil {
 		return nil, err
-	}
-	if len(raw) == 0 || raw[0] != '{' {
-		return nil, errors.New("MIoT spec instance is not a JSON object")
 	}
 	if format == "" {
 		return raw, nil
@@ -100,23 +215,26 @@ func (s *SpecClient) Spec(ctx context.Context, model, format string) (any, error
 	return formatSpec(instance.Services, format == "python", s.registry()+"/instance?type="+urn), nil
 }
 
-func (s *SpecClient) registry() string {
+func (s *Client) registry() string {
 	if s.baseURL == "" {
-		return specRegistry
+		return RegistryURL
 	}
 	return s.baseURL
 }
 
-func (s *SpecClient) fetch(ctx context.Context, endpoint string, dest any) error {
+func (s *Client) httpClient() *http.Client {
+	if s.http != nil {
+		return s.http
+	}
+	return &http.Client{Timeout: 15 * time.Second}
+}
+
+func (s *Client) fetch(ctx context.Context, endpoint string, dest any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.registry()+endpoint, nil)
 	if err != nil {
 		return err
 	}
-	client := s.http
-	if client == nil {
-		client = specHTTP
-	}
-	resp, err := client.Do(req)
+	resp, err := s.httpClient().Do(req)
 	if err != nil {
 		return err
 	}
@@ -137,28 +255,28 @@ func (s *SpecClient) fetch(ctx context.Context, endpoint string, dest any) error
 	return nil
 }
 
-func (s *SpecClient) matchModels(ctx context.Context, keyword string) (map[string]string, error) {
+func (s *Client) matchModels(ctx context.Context, keyword string) (map[string]string, error) {
 	var load *specIndexLoad
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		s.mu.Lock()
+		s.indexMu.Lock()
 		if s.index == nil {
-			s.index = readSpecIndex(s.cachePath)
+			s.index = readJSONCache[string](s.indexCachePath)
 		}
 		if matches := filterSpecModels(s.index, keyword); len(matches) > 0 {
-			s.mu.Unlock()
+			s.indexMu.Unlock()
 			return matches, nil
 		}
-		load = s.loading
+		load = s.indexLoad
 		if load == nil {
 			load = &specIndexLoad{done: make(chan struct{})}
-			s.loading = load
-			s.mu.Unlock()
+			s.indexLoad = load
+			s.indexMu.Unlock()
 			break
 		}
-		s.mu.Unlock()
+		s.indexMu.Unlock()
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -174,18 +292,18 @@ func (s *SpecClient) matchModels(ctx context.Context, keyword string) (map[strin
 	}
 
 	index, err := s.fetchSpecIndex(ctx)
-	if err == nil && s.cachePath != "" {
-		writeSpecIndex(s.cachePath, index)
+	if err == nil && s.indexCachePath != "" {
+		writeJSONCache(s.indexCachePath, index)
 	}
-	s.mu.Lock()
+	s.indexMu.Lock()
 	if err == nil {
 		s.index = index
 	}
 	load.index, load.err = index, err
 	load.abandoned = err != nil && ctx.Err() != nil
-	s.loading = nil
+	s.indexLoad = nil
 	close(load.done)
-	s.mu.Unlock()
+	s.indexMu.Unlock()
 	if err != nil {
 		return nil, err
 	}
@@ -205,7 +323,7 @@ func filterSpecModels(index map[string]string, keyword string) map[string]string
 	return matches
 }
 
-func (s *SpecClient) fetchSpecIndex(ctx context.Context) (map[string]string, error) {
+func (s *Client) fetchSpecIndex(ctx context.Context) (map[string]string, error) {
 	var raw struct {
 		Instances []struct{ Model, Type string }
 	}
@@ -224,46 +342,13 @@ func (s *SpecClient) fetchSpecIndex(ctx context.Context) (map[string]string, err
 	return index, nil
 }
 
-func readSpecIndex(path string) map[string]string {
-	index := map[string]string{}
-	if path == "" {
-		return index
-	}
-	usable := func(info os.FileInfo) bool {
-		return info.Mode().IsRegular() && info.Mode().Perm()&0022 == 0 && info.Size() <= specMaxSize
-	}
-	before, err := os.Lstat(path)
-	if err != nil || !usable(before) {
-		return index
-	}
-	// Nonblocking open also handles replacement by a FIFO after Lstat.
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return index
-	}
-	defer f.Close()
-	after, err := f.Stat()
-	if err != nil || !usable(after) || !os.SameFile(before, after) {
-		return index
-	}
-	data, err := io.ReadAll(io.LimitReader(f, specMaxSize+1))
-	if err != nil || len(data) > specMaxSize {
-		return index
-	}
-	var cached map[string]string
-	if json.Unmarshal(data, &cached) == nil && cached != nil {
-		return cached
-	}
-	return index
-}
-
-func writeSpecIndex(path string, index map[string]string) {
+func writeJSONCache(path string, data any) {
 	f, err := os.CreateTemp(filepath.Dir(path), ".miot-spec-*")
 	if err != nil {
 		return // Cache failures do not prevent public lookups.
 	}
 	defer os.Remove(f.Name())
-	err = json.NewEncoder(f).Encode(index)
+	err = json.NewEncoder(f).Encode(data)
 	if closeErr := f.Close(); err == nil && closeErr == nil {
 		_ = os.Rename(f.Name(), path)
 	}
@@ -363,8 +448,6 @@ func pythonSpecValue(raw json.RawMessage) (string, bool) {
 	if text == "" || !strings.ContainsRune("-0123456789", rune(text[0])) {
 		return "", false
 	}
-	// RawMessage values came from valid JSON, so numeric values cannot contain
-	// expressions. Limit int literals and reject floats that would overflow.
 	if !strings.ContainsAny(text, ".eE") {
 		return text, len(strings.TrimPrefix(text, "-")) <= 640
 	}
@@ -383,7 +466,6 @@ func formatSpec(services []specService, python bool, endpoint string) string {
 	var enums []enum
 	if python {
 		endpoint = specSingleLine(endpoint)
-		// This is the second source line, where Python recognizes coding cookies.
 		endpoint = strings.NewReplacer("coding:", "coding%3A", "coding=", "coding%3D").Replace(endpoint)
 	}
 	fmt.Fprintf(&b, "# Generated by https://github.com/Yonsm/MiService\n# %s\n\n", endpoint)

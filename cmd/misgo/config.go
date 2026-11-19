@@ -1,5 +1,4 @@
-// Package misgo provides Xiaomi account, MiIO, MIoT, and MiNA clients.
-package misgo
+package main
 
 import (
 	"errors"
@@ -50,5 +49,5 @@ func HomeTokenPath() (string, error) {
 		}
 		home = current.HomeDir
 	}
-	return filepath.Join(home, DefaultTokenPath), nil
+	return filepath.Join(home, ".mi.token"), nil
 }

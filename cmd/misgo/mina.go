@@ -8,7 +8,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/Yonsm/misgo"
+	"github.com/Yonsm/misgo/mina"
 )
 
 var minaHelp = [...]struct{ command, description string }{
@@ -37,7 +37,7 @@ type minaDeviceService interface {
 	GetLatestAsk(context.Context, string) ([]map[string]any, error)
 }
 
-var _ minaDeviceService = (*misgo.MiNAService)(nil)
+var _ minaDeviceService = (*mina.Service)(nil)
 
 func runMina(ctx context.Context, service minaDeviceService, text, did string, stdout, stderr io.Writer) (int, error) {
 	devices, err := service.DeviceList(ctx)

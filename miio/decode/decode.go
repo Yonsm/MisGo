@@ -1,31 +1,31 @@
-package misgo
+// Package decode decrypts captured MIoT responses offline.
+package decode
 
 import (
 	"bytes"
 	"compress/gzip"
 	"crypto/rc4"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+
+	"github.com/Yonsm/misgo/miio/sign"
 )
 
 // Decode decrypts a captured MIoT response using its ssecurity and nonce and
 // returns its JSON payload. If unzip is set, gzip-compressed payloads are unzipped.
-func Decode(ssecurity, nonce, data string, unzip bool) (any, error) {
-	signed, err := SignNonce(ssecurity, nonce)
+func Decode(ssecurity, encodedNonce, data string, unzip bool) (any, error) {
+	key, err := sign.Nonce(ssecurity, encodedNonce)
 	if err != nil {
 		return nil, err
-	}
-	key, err := base64.StdEncoding.DecodeString(signed)
-	if err != nil {
-		return nil, fmt.Errorf("invalid MIoT signed nonce: %w", err)
 	}
 	body, err := base64.StdEncoding.DecodeString(data)
 	if err != nil {
 		return nil, fmt.Errorf("invalid MIoT ciphertext: %w", err)
 	}
-	cipher, err := rc4.NewCipher(key)
+	cipher, err := rc4.NewCipher(key[:])
 	if err != nil {
 		return nil, err
 	}
@@ -48,8 +48,13 @@ func Decode(ssecurity, nonce, data string, unzip bool) (any, error) {
 			return nil, errors.New("MIoT gzip payload exceeds size limit")
 		}
 	}
-	result, err := commandJSON(body)
-	if err != nil {
+	if !json.Valid(body) {
+		return nil, errors.New("invalid MIoT decoded payload: expected a single JSON value")
+	}
+	var result any
+	d := json.NewDecoder(bytes.NewReader(body))
+	d.UseNumber()
+	if err := d.Decode(&result); err != nil {
 		return nil, fmt.Errorf("invalid MIoT decoded payload: %w", err)
 	}
 	return result, nil

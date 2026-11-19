@@ -14,7 +14,12 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/Yonsm/misgo"
+	"github.com/Yonsm/misgo/account"
+	"github.com/Yonsm/misgo/local"
+	"github.com/Yonsm/misgo/miio"
+	"github.com/Yonsm/misgo/miio/decode"
+	"github.com/Yonsm/misgo/mina"
+	"github.com/Yonsm/misgo/spec"
 )
 
 func main() {
@@ -48,7 +53,7 @@ func run(ctx context.Context, name string, args []string, stdin io.Reader, stdou
 	}
 	levels := [...]slog.Level{100, 12, slog.LevelError, slog.LevelWarn, slog.LevelInfo, slog.LevelDebug}
 	logger := slog.New(newLogHandler(stderr, levels[verbosity]))
-	cfg := misgo.ConfigFromEnv()
+	cfg := ConfigFromEnv()
 	text := strings.Join(args, " ")
 	if cfg.Local != "" {
 		address, token, err := cfg.LocalTarget()
@@ -56,24 +61,43 @@ func run(ctx context.Context, name string, args []string, stdin io.Reader, stdou
 			fmt.Fprintln(stderr, "Error:", err)
 			return 1
 		}
-		local, err := misgo.NewMiIOLocalService(address, token)
+		svc, err := local.New(address, token)
 		if err != nil {
 			return report(stderr, logger, err)
 		}
-		result, err := misgo.LocalCommand(ctx, local, text, prefix)
+		result, err := svc.Command(ctx, text, prefix)
 		if err == nil {
 			err = printResult(stdout, result)
 		}
 		return report(stderr, logger, err)
 	}
-	path, err := misgo.HomeTokenPath()
+	cmd, arg, _ := strings.Cut(text, " ")
+	if cmd == "spec" || cmd == "decode" {
+		var argv [4]string
+		copy(argv[:], strings.SplitN(arg, " ", len(argv)+1))
+		var result any
+		var err error
+		if cmd == "spec" {
+			result, err = spec.New(spec.WithIndexCache(spec.DefaultIndexCachePath())).Spec(ctx, argv[0], argv[1])
+		} else if argv[0] == "" || argv[1] == "" || argv[2] == "" {
+			err = fmt.Errorf("usage: decode <ssecurity> <nonce> <data> [gzip]")
+		} else {
+			result, err = decode.Decode(argv[0], argv[1], argv[2], argv[3] == "gzip")
+		}
+		if err == nil {
+			err = printResult(stdout, result)
+		}
+		return report(stderr, logger, err)
+	}
+	path, err := HomeTokenPath()
 	if err != nil {
 		return report(stderr, logger, err)
 	}
 	reader := bufio.NewReader(stdin)
-	account := misgo.NewMiAccount(cfg.Username, cfg.Password,
-		misgo.WithTokenPath(path), misgo.WithLogger(logger),
-		misgo.WithOTPCallback(func(ctx context.Context, method string) (string, error) {
+	acct := account.New(cfg.Username, cfg.Password,
+		account.WithTokenPath(path),
+		account.WithLogger(logger),
+		account.WithOTPCallback(func(ctx context.Context, method string) (string, error) {
 			fmt.Fprintf(stdout, "Input %s Code: ", method)
 			type input struct {
 				line string
@@ -98,15 +122,15 @@ func run(ctx context.Context, name string, args []string, stdin io.Reader, stdou
 			}
 		}),
 	)
-	defer account.Close()
+	defer acct.Close()
 	if text == "mina" || strings.HasPrefix(text, "mina ") {
-		code, err := runMina(ctx, misgo.NewMiNAService(account), strings.TrimPrefix(text, "mina"), cfg.DID, stdout, stderr)
+		code, err := runMina(ctx, mina.New(acct), strings.TrimPrefix(text, "mina"), cfg.DID, stdout, stderr)
 		if err != nil {
 			return report(stderr, logger, err)
 		}
 		return code
 	}
-	result, err := misgo.Command(ctx, misgo.NewMiIOService(account, ""), cfg.DID, text, prefix)
+	result, err := miio.New(acct, "").Command(ctx, cfg.DID, text, prefix)
 	if err == nil {
 		err = printResult(stdout, result)
 	}
@@ -114,19 +138,19 @@ func run(ctx context.Context, name string, args []string, stdin io.Reader, stdou
 }
 
 func usage(w io.Writer, prefix string) {
-	fmt.Fprintf(w, "MisGo %s - XiaoMi Cloud Service\n\n", misgo.Version)
+	fmt.Fprintf(w, "MisGo %s - XiaoMi Cloud Service\n\n", Version)
 	fmt.Fprintln(w, "Usage: The following variables must be set:")
 	fmt.Fprintln(w, "           export MI_USER=<Username>")
 	fmt.Fprintln(w, "           export MI_PASS=<Password>")
 	fmt.Fprint(w, "           export MI_DID=<Device ID|Name>\n\n")
-	fmt.Fprintln(w, misgo.CommandHelp("", prefix))
+	fmt.Fprintln(w, miio.Help("", prefix))
 	fmt.Fprintln(w, "MiNA Commands:")
 	for _, item := range minaHelp {
 		fmt.Fprintf(w, "           %smina %-11s%s\n", prefix, item.command, item.description)
 	}
 	fmt.Fprint(w, "\nLocal Device (no cloud account, direct LAN control):\n")
 	fmt.Fprint(w, "           export MI_LOCAL=<IP>:<Token>\n\n")
-	fmt.Fprintln(w, misgo.LocalCommandHelp(prefix))
+	fmt.Fprintln(w, local.Help(prefix))
 }
 
 func printResult(w io.Writer, value any) error {
@@ -162,7 +186,6 @@ func newLogHandler(w io.Writer, level slog.Level) slog.Handler {
 	return lineHandler{out: w, level: level, mu: new(sync.Mutex)}
 }
 
-// lineHandler emits the unadorned messages used by MiService's CLI logger.
 type lineHandler struct {
 	out   io.Writer
 	level slog.Level

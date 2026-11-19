@@ -1,4 +1,4 @@
-package misgo
+package miio
 
 import (
 	"bytes"
@@ -6,30 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"strconv"
 	"strings"
+
+	"github.com/Yonsm/misgo/command"
 )
 
-// CommandCloud is the cloud service used by the command interpreter.
-type CommandCloud interface {
-	MiIORequest(ctx context.Context, uri string, data any) (any, error)
-	MIoTRequest(ctx context.Context, cmd string, params any) (any, error)
-	DeviceList(ctx context.Context, name string, virtual bool, huami int) ([]map[string]any, error)
-	HomeList(ctx context.Context, name string) ([]map[string]any, error)
-	MiIOGetProps(ctx context.Context, did string, iids []string) ([]any, error)
-	MiIOSetProps(ctx context.Context, did string, props []Property) ([]any, error)
-	MIoTAction(ctx context.Context, did string, iid IID, args []any) (int, error)
-}
-
-// Command executes a MiIO/MIoT command, using the public registry for spec lookups.
-// A nil cloud is sufficient for help, spec, and decode commands.
-func Command(ctx context.Context, cloud CommandCloud, did, text string, prefix ...string) (any, error) {
-	return defaultSpecs.Command(ctx, cloud, did, text, prefix...)
-}
-
-// Command executes a MiIO/MIoT command with this client's spec registry.
-func (s *SpecClient) Command(ctx context.Context, cloud CommandCloud, did, text string, prefix ...string) (any, error) {
+// Command parses and runs a cloud MiIO/MIoT text command.
+// A nil service is sufficient for help.
+func (m *Service) Command(ctx context.Context, did, text string, prefix ...string) (any, error) {
 	cmd, arg, hasArg := strings.Cut(text, " ")
 	var argv []string
 	if arg != "" {
@@ -44,22 +29,15 @@ func (s *SpecClient) Command(ctx context.Context, cloud CommandCloud, did, text 
 
 	switch cmd {
 	case "", "?", "？", "help", "-h", "--help":
-		return CommandHelp(did, prefix...), nil
-	case "spec":
-		return s.Spec(ctx, at(0), at(1))
-	case "decode":
-		if len(argv) < 3 || at(0) == "" || at(1) == "" || at(2) == "" {
-			return nil, errors.New("usage: decode <ssecurity> <nonce> <data> [gzip]")
-		}
-		return Decode(at(0), at(1), at(2), at(3) == "gzip")
+		return Help(did, prefix...), nil
 	}
 
 	rawMiIO := strings.HasPrefix(cmd, "/")
 	rawMIoT := strings.HasPrefix(cmd, "prop") || cmd == "action"
 	if did == "" && !rawMiIO && !rawMIoT && cmd != "list" && cmd != "home" {
-		return CommandHelp(did, prefix...), nil
+		return Help(did, prefix...), nil
 	}
-	if cloud == nil {
+	if m == nil {
 		return nil, errors.New("MiIO command requires a cloud service")
 	}
 
@@ -69,7 +47,7 @@ func (s *SpecClient) Command(ctx context.Context, cloud CommandCloud, did, text 
 		if hasArg {
 			data = arg
 		}
-		return cloud.MiIORequest(ctx, cmd, data)
+		return m.MiIORequest(ctx, cmd, data)
 	case rawMIoT:
 		var params any
 		if arg != "" {
@@ -78,7 +56,7 @@ func (s *SpecClient) Command(ctx context.Context, cloud CommandCloud, did, text 
 				return nil, fmt.Errorf("invalid %s JSON parameters: %w", cmd, err)
 			}
 		}
-		return cloud.MIoTRequest(ctx, cmd, params)
+		return m.MIoTRequest(ctx, cmd, params)
 	case cmd == "list":
 		var huami int
 		if at(2) != "" {
@@ -87,13 +65,13 @@ func (s *SpecClient) Command(ctx context.Context, cloud CommandCloud, did, text 
 				return nil, fmt.Errorf("invalid getHuamiDevices: %w", err)
 			}
 		}
-		return cloud.DeviceList(ctx, at(0), commandTruthy(parseCommandValue(at(1))), huami)
+		return m.DeviceList(ctx, at(0), commandTruthy(command.ParseValue(at(1))), huami)
 	case cmd == "home":
-		return cloud.HomeList(ctx, at(0))
+		return m.HomeList(ctx, at(0))
 	}
 
-	if !commandDigits(did) {
-		devices, err := cloud.DeviceList(ctx, did, false, 0)
+	if strings.Trim(did, "0123456789") != "" {
+		devices, err := m.DeviceList(ctx, did, false, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -118,7 +96,7 @@ func (s *SpecClient) Command(ctx context.Context, cloud CommandCloud, did, text 
 	items := strings.Split(cmd, ",")
 	ids := make([]string, len(items))
 	var props []Property
-	miot := commandStartsDigit(items[0])
+	miot := numericIID(items[0])
 	write := strings.Contains(items[0], "=")
 	for i, item := range items {
 		key, value, hasValue := strings.Cut(item, "=")
@@ -130,12 +108,12 @@ func (s *SpecClient) Command(ctx context.Context, cloud CommandCloud, did, text 
 		}
 		ids[i] = key
 		if write {
-			props = append(props, Property{IID: key, Value: parseCommandValue(value)})
+			props = append(props, Property{IID: key, Value: command.ParseValue(value)})
 		}
 	}
 	switch {
 	case write:
-		return cloud.MiIOSetProps(ctx, did, props)
+		return m.MiIOSetProps(ctx, did, props)
 	case miot && arg != "":
 		id, err := ParseIID(ids[0])
 		if err != nil {
@@ -144,25 +122,18 @@ func (s *SpecClient) Command(ctx context.Context, cloud CommandCloud, did, text 
 		args := []any{}
 		if arg != "[]" {
 			for _, value := range argv {
-				args = append(args, parseCommandValue(value))
+				args = append(args, command.ParseValue(value))
 			}
 		}
-		return cloud.MIoTAction(ctx, did, id, args)
+		return m.MIoTAction(ctx, did, id, args)
 	default:
-		return cloud.MiIOGetProps(ctx, did, ids)
+		return m.MiIOGetProps(ctx, did, ids)
 	}
 }
 
-func commandPrefix(prefix []string) string {
-	if len(prefix) == 0 {
-		return "?"
-	}
-	return prefix[0]
-}
-
-// CommandHelp returns help text for the cloud command syntax.
-func CommandHelp(did string, prefixes ...string) string {
-	prefix := commandPrefix(prefixes)
+// Help returns help text for the cloud command syntax.
+func Help(did string, prefixes ...string) string {
+	prefix := command.Prefix(prefixes)
 	quote := "'"
 	if prefix == "?" {
 		quote = ""
@@ -202,47 +173,6 @@ MIoT Spec: %[1]sspec [model_keyword|type_urn] [text|python]
 
 MIoT Decode: %[1]sdecode <ssecurity> <nonce> <data> [gzip]
 `, prefix, quote, did)
-}
-
-func commandStartsDigit(text string) bool {
-	return text != "" && text[0] >= '0' && text[0] <= '9'
-}
-
-func commandDigits(text string) bool {
-	return text != "" && strings.IndexFunc(text, func(r rune) bool { return r < '0' || r > '9' }) < 0
-}
-
-func parseCommandValue(text string) any {
-	if text != "" && strings.ContainsRune(`"'#`, rune(text[0])) {
-		text = text[1:]
-		if text != "" && strings.ContainsRune(`"'#`, rune(text[len(text)-1])) {
-			text = text[:len(text)-1]
-		}
-		return text
-	}
-	switch text {
-	case "null":
-		return nil
-	case "true":
-		return true
-	case "false":
-		return false
-	}
-	if commandDigits(text) {
-		if n, err := strconv.ParseInt(text, 10, 64); err == nil {
-			return n
-		}
-		return json.Number(strings.TrimLeft(text, "0"))
-	}
-	if value, err := strconv.ParseFloat(strings.TrimSpace(text), 64); err == nil &&
-		!strings.ContainsAny(text, "xX") && !math.IsNaN(value) && !math.IsInf(value, 0) {
-		s := strconv.FormatFloat(value, 'g', -1, 64)
-		if !strings.ContainsAny(s, ".eE") {
-			s += ".0"
-		}
-		return json.Number(s)
-	}
-	return text
 }
 
 func commandTruthy(value any) bool {

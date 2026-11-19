@@ -1,7 +1,8 @@
-package misgo
+// Package account manages Xiaomi account authentication, OTP verification,
+// token persistence, and authenticated service requests.
+package account
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/md5"
@@ -21,6 +22,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -29,13 +31,28 @@ const (
 	AccountBase      = "https://account.xiaomi.com"
 	UALogin          = "APP/com.xiaomi.mihome APPV/11.3.203 iosPassportSDK/4.2.50 iOS/26.3.1 MK/aVBob25lMTcsMg== DEVT/aVBob25l DEVS/aU9T BRA/QXBwbGU= L/zh_CN"
 	UAOTP            = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 iOS/26.3.1 MiHome/11.3.203 iPhone/iPhone17,2 DeviceId/%s APP/com.xiaomi.mihome APPV/11.3.203 Platform/iPhone Region/CN /xiaomi/miuibrowser/4.3/smartHome/ios/iPhone17,2/11.3.203 " + UALogin
-	UAMiIO           = "iOS-14.4-6.0.103-iPhone12,3--D7744744F7AF32F0544445285880DD63E47D9BE9-8816080-84A3F44E137B71AE-iPhone"
-	UAMiNA           = "MiHome/6.0.103 (com.xiaomi.mihome; build:6.0.103.1; iOS 14.4.0) Alamofire/6.0.103 MICO/iOSApp/appStore/6.0.103"
 	DefaultTokenPath = ".mi.token"
 	loginCooldown    = 2 * time.Hour
 	loginRetryMax    = 5
 	loginRateCode    = 70022
 )
+
+// APIError represents an HTTP or business-level error returned by a Xiaomi service.
+type APIError struct {
+	HTTPStatus int
+	Code       int
+	Message    string
+}
+
+func (e *APIError) Error() string {
+	if e.HTTPStatus != 0 && e.HTTPStatus != http.StatusOK {
+		return fmt.Sprintf("Xiaomi service HTTP %d", e.HTTPStatus)
+	}
+	if e.Message != "" {
+		return fmt.Sprintf("Xiaomi service request failed (code=%d): %s", e.Code, e.Message)
+	}
+	return fmt.Sprintf("Xiaomi service request failed (code=%d)", e.Code)
+}
 
 var (
 	ErrOTPRequired      = errors.New("Xiaomi login requires OTP verification")
@@ -98,7 +115,7 @@ func (t *MiToken) UnmarshalJSON(data []byte) error {
 			}
 			continue
 		}
-		if err := decodeAccountJSON(raw, dst); err != nil {
+		if err := DecodeJSON(raw, dst); err != nil {
 			return err
 		}
 	}
@@ -152,33 +169,35 @@ func (s FileTokenStore) SaveToken(ctx context.Context, t *MiToken) error {
 	return os.Rename(f.Name(), s.Path)
 }
 
-type AccountOption func(*MiAccount)
+type Option func(*MiAccount)
 
-func WithHTTPClient(client *http.Client) AccountOption {
+func WithHTTPClient(client *http.Client) Option {
 	return func(a *MiAccount) { a.client = client }
 }
 
-func WithTokenStore(store TokenStore) AccountOption {
+func WithTokenStore(store TokenStore) Option {
 	return func(a *MiAccount) { a.store = store }
 }
 
 // WithTokenPath selects the token file, or disables persistence when path is empty.
-func WithTokenPath(path string) AccountOption {
+func WithTokenPath(path string) Option {
 	if path == "" {
 		return WithTokenStore(nil)
 	}
 	return WithTokenStore(FileTokenStore{Path: path})
 }
 
-func WithOTPCallback(callback OTPCallback) AccountOption {
+func WithOTPCallback(callback OTPCallback) Option {
 	return func(a *MiAccount) { a.otp = callback }
 }
 
-func WithLogger(logger *slog.Logger) AccountOption {
+func WithLogger(logger *slog.Logger) Option {
 	return func(a *MiAccount) { a.logger = logger }
 }
 
 // MiAccount authorizes requests to Xiaomi services and shares the login across SIDs.
+// By default, OTP verification is disabled (returns ErrOTPRequired) so non-interactive
+// services never block on stdin; pass WithOTPCallback to handle 2FA interactively.
 type MiAccount struct {
 	username, password string
 	client             *http.Client
@@ -193,10 +212,11 @@ type MiAccount struct {
 	cooldownUntil      time.Time
 }
 
-func NewMiAccount(username, password string, options ...AccountOption) *MiAccount {
+// New creates a MiAccount with FileTokenStore(".mi.token") and no interactive OTP callback.
+func New(username, password string, options ...Option) *MiAccount {
 	a := &MiAccount{
 		username: username, password: password, store: FileTokenStore{Path: DefaultTokenPath},
-		otp: terminalOTP, logger: slog.Default(), gate: make(chan struct{}, 1),
+		logger: slog.Default(), gate: make(chan struct{}, 1),
 	}
 	for _, option := range options {
 		option(a)
@@ -216,44 +236,6 @@ func (a *MiAccount) Close() error {
 	return nil
 }
 
-var terminalOTPGate = make(chan struct{}, 1)
-var terminalOTPInput = bufio.NewReader(os.Stdin)
-
-func terminalOTP(ctx context.Context, method string) (string, error) {
-	select {
-	case terminalOTPGate <- struct{}{}:
-	case <-ctx.Done():
-		return "", ctx.Err()
-	}
-	if err := ctx.Err(); err != nil {
-		<-terminalOTPGate
-		return "", err
-	}
-	if _, err := fmt.Fprintf(os.Stderr, "Input %s Code: ", method); err != nil {
-		<-terminalOTPGate
-		return "", err
-	}
-	type result struct {
-		text string
-		err  error
-	}
-	line := make(chan result, 1)
-	go func() {
-		defer func() { <-terminalOTPGate }()
-		text, err := terminalOTPInput.ReadString('\n')
-		line <- result{text, err}
-	}()
-	select {
-	case r := <-line:
-		if r.err != nil && !(r.err == io.EOF && r.text != "") {
-			return "", fmt.Errorf("%w: no code on stdin; set an OTP callback for non-interactive use", ErrOTPRequired)
-		}
-		return strings.TrimSpace(r.text), nil
-	case <-ctx.Done():
-		return "", ctx.Err()
-	}
-}
-
 // RandomString returns an alphanumeric string sampled without replacement.
 func RandomString(length int) (string, error) {
 	pool := []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
@@ -271,7 +253,8 @@ func RandomString(length int) (string, error) {
 	return string(pool[:length]), nil
 }
 
-func decodeAccountJSON(b []byte, dst any) error {
+// DecodeJSON decodes a single JSON value using json.Number and rejects trailing bytes.
+func DecodeJSON(b []byte, dst any) error {
 	decoder := json.NewDecoder(bytes.NewReader(b))
 	decoder.UseNumber()
 	if err := decoder.Decode(dst); err != nil {
@@ -283,7 +266,8 @@ func decodeAccountJSON(b []byte, dst any) error {
 	return nil
 }
 
-func accountString(v any) string {
+// String converts a JSON scalar (string, json.Number, or integer) to a string.
+func String(v any) string {
 	switch v := v.(type) {
 	case string:
 		return v
@@ -299,14 +283,15 @@ func validServiceToken(sid string, token ServiceToken) bool {
 	if token.ServiceToken == "" || token.SSecurity == "" {
 		return false
 	}
-	if sid == miIOSID {
+	if sid == "xiaomiio" {
 		secret, err := base64.StdEncoding.DecodeString(token.SSecurity)
 		return err == nil && len(secret) != 0
 	}
 	return true
 }
 
-func isZeroCode(v any) bool {
+// IsZeroCode reports whether a Xiaomi API code value equals zero.
+func IsZeroCode(v any) bool {
 	switch n := v.(type) {
 	case json.Number:
 		f, err := n.Float64()
@@ -397,7 +382,7 @@ func (a *MiAccount) persist(ctx context.Context, token *MiToken) {
 }
 
 func sameServiceToken(a, b *MiToken, sid string) bool {
-	return a != nil && b != nil && accountString(a.UserID) == accountString(b.UserID) && a.Services[sid] == b.Services[sid]
+	return a != nil && b != nil && String(a.UserID) == String(b.UserID) && a.Services[sid] == b.Services[sid]
 }
 
 func withoutServiceToken(old *MiToken, sid string) *MiToken {
@@ -429,7 +414,7 @@ func (a *MiAccount) session(ctx context.Context, sid string, rejected *MiToken) 
 				return nil, ctx.Err()
 			}
 			a.log(ctx, slog.LevelWarn, "Could not load Xiaomi token cache")
-		} else if token != nil && token.DeviceID != "" && accountString(token.UserID) != "" && (token.Username == "" || a.username == "" || a.username == token.Username) {
+		} else if token != nil && token.DeviceID != "" && String(token.UserID) != "" && (token.Username == "" || a.username == "" || a.username == token.Username) {
 			a.token = token
 		}
 		a.loaded = true
@@ -533,7 +518,7 @@ func accountLoginJSON(resp *http.Response, dst any) error {
 	if len(bytes.TrimSpace(b)) == 0 {
 		return nil
 	}
-	if decodeAccountJSON(b, dst) != nil {
+	if DecodeJSON(b, dst) != nil {
 		return errors.New("invalid Xiaomi login JSON response")
 	}
 	return nil
@@ -609,7 +594,7 @@ func (a *MiAccount) login(ctx context.Context, sid string, fresh bool) (*MiToken
 				fresh = fresh || c.Name == "passToken"
 			}
 			if !fresh {
-				req.AddCookie(&http.Cookie{Name: "userId", Value: accountString(t.UserID)})
+				req.AddCookie(&http.Cookie{Name: "userId", Value: String(t.UserID)})
 				req.AddCookie(&http.Cookie{Name: "passToken", Value: t.PassToken})
 			}
 		}
@@ -674,14 +659,14 @@ func (a *MiAccount) login(ctx context.Context, sid string, fresh bool) (*MiToken
 	if accountCode(r.Code) != 0 {
 		return nil, fmt.Errorf("Xiaomi login failed (code=%d)", accountCode(r.Code))
 	}
-	if accountString(r.UserID) == "" || accountString(r.Nonce) == "" || r.PassToken == "" || r.SSecurity == "" {
+	if String(r.UserID) == "" || String(r.Nonce) == "" || r.PassToken == "" || r.SSecurity == "" {
 		return nil, errors.New("Xiaomi login response is missing token parameters")
 	}
 	location, err := resolveLoginURL(base, r.Location)
 	if err != nil {
 		return nil, err
 	}
-	sign := sha1.Sum([]byte("nonce=" + accountString(r.Nonce) + "&" + r.SSecurity))
+	sign := sha1.Sum([]byte("nonce=" + String(r.Nonce) + "&" + r.SSecurity))
 	if location.RawQuery != "" {
 		location.RawQuery += "&"
 	}
@@ -704,7 +689,7 @@ func (a *MiAccount) login(ctx context.Context, sid string, fresh bool) (*MiToken
 	if !validServiceToken(sid, svc) {
 		return nil, errors.New("Xiaomi login returned invalid service credentials")
 	}
-	if a.token != nil && accountString(a.token.UserID) != accountString(r.UserID) {
+	if a.token != nil && String(a.token.UserID) != String(r.UserID) {
 		clear(t.Services)
 	}
 	t.UserID, t.PassToken = r.UserID, r.PassToken
@@ -862,11 +847,6 @@ func (a *MiAccount) MiRequestWith(ctx context.Context, sid, address string, head
 	if err != nil || !trustedServiceURL(u) {
 		return nil, errors.New("invalid Xiaomi service URL")
 	}
-	host := u.Hostname()
-	isMiIO := host == "api.io.mi.com" || strings.HasSuffix(host, ".api.io.mi.com")
-	if sid == miIOSID && !isMiIO || sid == miNASID && isMiIO {
-		return nil, errors.New("Xiaomi service ID does not match the API host")
-	}
 	var rejected *MiToken
 	client := *a.client
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
@@ -886,7 +866,7 @@ func (a *MiAccount) MiRequestWith(ctx context.Context, sid, address string, head
 		if err != nil {
 			return nil, err
 		}
-		form, cookies, err := prepare(MiRequestSession{t.DeviceID, accountString(t.UserID), t.Services[sid].SSecurity})
+		form, cookies, err := prepare(MiRequestSession{t.DeviceID, String(t.UserID), t.Services[sid].SSecurity})
 		if err != nil {
 			return nil, err
 		}
@@ -897,7 +877,7 @@ func (a *MiAccount) MiRequestWith(ctx context.Context, sid, address string, head
 		// Rebuild the Cookie header so extras cannot shadow the session identity.
 		extra := req.Cookies()
 		req.Header.Del("Cookie")
-		req.AddCookie(&http.Cookie{Name: "userId", Value: accountString(t.UserID)})
+		req.AddCookie(&http.Cookie{Name: "userId", Value: String(t.UserID)})
 		req.AddCookie(&http.Cookie{Name: "serviceToken", Value: t.Services[sid].ServiceToken})
 		addExtra := func(c *http.Cookie) {
 			if c != nil && !strings.EqualFold(c.Name, "userId") && !strings.EqualFold(c.Name, "serviceToken") {
@@ -918,7 +898,7 @@ func (a *MiAccount) MiRequestWith(ctx context.Context, sid, address string, head
 		auth := status == http.StatusUnauthorized
 		if status != http.StatusOK {
 			resp.Body.Close()
-			err = fmt.Errorf("Xiaomi service HTTP %d", status)
+			err = &APIError{HTTPStatus: status}
 		} else {
 			body, readErr := readAccountBody(resp)
 			resp.Body.Close()
@@ -926,19 +906,21 @@ func (a *MiAccount) MiRequestWith(ctx context.Context, sid, address string, head
 				return nil, readErr
 			}
 			var result map[string]any
-			if decodeAccountJSON(body, &result) != nil {
+			if DecodeJSON(body, &result) != nil {
 				return nil, errors.New("invalid Xiaomi service JSON response")
 			}
-			if isZeroCode(result["code"]) {
+			if IsZeroCode(result["code"]) {
 				return result, nil
 			}
 			message, _ := result["message"].(string)
 			auth = strings.Contains(strings.ToLower(message), "auth")
-			code, ok := result["code"].(json.Number)
-			if !ok {
-				code = "-1"
+			code := -1
+			if n, ok := result["code"].(json.Number); ok {
+				if parsed, convErr := strconv.Atoi(string(n)); convErr == nil {
+					code = parsed
+				}
 			}
-			err = fmt.Errorf("Xiaomi service request failed (code=%s)", code)
+			err = &APIError{HTTPStatus: status, Code: code, Message: message}
 		}
 		if !retryAuth || !auth || attempt == 1 {
 			return nil, err

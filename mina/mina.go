@@ -1,4 +1,5 @@
-package misgo
+// Package mina controls XiaoAi smart speakers and retrieves playback and query status.
+package mina
 
 import (
 	"context"
@@ -12,35 +13,39 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/Yonsm/misgo/account"
 )
 
 const (
-	miNASID         = "micoapi"
+	SID             = "micoapi"
+	UA              = "MiHome/6.0.103 (com.xiaomi.mihome; build:6.0.103.1; iOS 14.4.0) Alamofire/6.0.103 MICO/iOSApp/appStore/6.0.103"
 	miNABase        = "https://api2.mina.mi.com"
 	miNAMedia       = "app_ios"
 	miNAMediaPlayer = "mediaplayer"
 )
 
-// MiNAService controls XiaoAi speakers and retrieves their playback and query status.
-type MiNAService struct {
-	account  *MiAccount
+// Service controls XiaoAi speakers and retrieves their playback and query status.
+type Service struct {
+	account  *account.MiAccount
 	mu       sync.RWMutex
 	hardware map[string]string
 }
 
-func NewMiNAService(account *MiAccount) *MiNAService {
-	return &MiNAService{account: account}
+// New creates a MiNA Service backed by the given account.
+func New(acct *account.MiAccount) *Service {
+	return &Service{account: acct}
 }
 
 // MiNARequest sends a GET with a nil form or a POST with a non-nil form.
-func (m *MiNAService) MiNARequest(ctx context.Context, uri string, form url.Values) (map[string]any, error) {
+func (m *Service) MiNARequest(ctx context.Context, uri string, form url.Values) (map[string]any, error) {
 	if m == nil || m.account == nil {
 		return nil, errors.New("MiNA cloud requests require an account")
 	}
 	if !strings.HasPrefix(uri, "/") || strings.HasPrefix(uri, "//") || strings.ContainsAny(uri, "#\r\n") {
 		return nil, errors.New("invalid MiNA request URI")
 	}
-	id, err := RandomString(30)
+	id, err := account.RandomString(30)
 	if err != nil {
 		return nil, err
 	}
@@ -55,7 +60,7 @@ func (m *MiNAService) MiNARequest(ctx context.Context, uri string, form url.Valu
 		form = maps.Clone(form)
 		form.Set("requestId", id)
 	}
-	return m.account.MiRequest(ctx, miNASID, miNABase+uri, form, http.Header{"User-Agent": {UAMiNA}})
+	return m.account.MiRequest(ctx, SID, miNABase+uri, form, http.Header{"User-Agent": {UA}})
 }
 
 func minaOption(fallback int, values []int) int {
@@ -66,7 +71,7 @@ func minaOption(fallback int, values []int) int {
 }
 
 // DeviceList returns the speakers for master (default 0) and caches their hardware models.
-func (m *MiNAService) DeviceList(ctx context.Context, master ...int) ([]map[string]any, error) {
+func (m *Service) DeviceList(ctx context.Context, master ...int) ([]map[string]any, error) {
 	result, err := m.MiNARequest(ctx, "/admin/v2/device_list?master="+strconv.Itoa(minaOption(0, master)), nil)
 	if err != nil || result["data"] == nil {
 		return nil, err
@@ -86,7 +91,7 @@ func (m *MiNAService) DeviceList(ctx context.Context, master ...int) ([]map[stri
 	return devices, nil
 }
 
-func (m *MiNAService) cacheDevices(devices []map[string]any) {
+func (m *Service) cacheDevices(devices []map[string]any) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, device := range devices {
@@ -101,13 +106,13 @@ func (m *MiNAService) cacheDevices(devices []map[string]any) {
 	}
 }
 
-func (m *MiNAService) cachedHardware(deviceID string) string {
+func (m *Service) cachedHardware(deviceID string) string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.hardware[deviceID]
 }
 
-func (m *MiNAService) ubusRequest(ctx context.Context, deviceID, method, path string, message map[string]any) (map[string]any, error) {
+func (m *Service) ubusRequest(ctx context.Context, deviceID, method, path string, message map[string]any) (map[string]any, error) {
 	body, err := json.Marshal(message)
 	if err != nil {
 		return nil, fmt.Errorf("encode MiNA ubus message: %w", err)
@@ -118,37 +123,37 @@ func (m *MiNAService) ubusRequest(ctx context.Context, deviceID, method, path st
 }
 
 // UbusRequest sends a device operation and reports whether the service accepted it.
-func (m *MiNAService) UbusRequest(ctx context.Context, deviceID, method, path string, message map[string]any) (bool, error) {
+func (m *Service) UbusRequest(ctx context.Context, deviceID, method, path string, message map[string]any) (bool, error) {
 	result, err := m.ubusRequest(ctx, deviceID, method, path, message)
 	return result != nil && err == nil, err
 }
 
-func (m *MiNAService) TextToSpeech(ctx context.Context, deviceID, text string) (bool, error) {
+func (m *Service) TextToSpeech(ctx context.Context, deviceID, text string) (bool, error) {
 	return m.UbusRequest(ctx, deviceID, "text_to_speech", "mibrain", map[string]any{"text": text})
 }
 
-func (m *MiNAService) PlayerSetVolume(ctx context.Context, deviceID string, volume int) (bool, error) {
+func (m *Service) PlayerSetVolume(ctx context.Context, deviceID string, volume int) (bool, error) {
 	return m.UbusRequest(ctx, deviceID, "player_set_volume", miNAMediaPlayer, map[string]any{"volume": volume, "media": miNAMedia})
 }
 
-func (m *MiNAService) playerOperation(ctx context.Context, deviceID, action string) (bool, error) {
+func (m *Service) playerOperation(ctx context.Context, deviceID, action string) (bool, error) {
 	return m.UbusRequest(ctx, deviceID, "player_play_operation", miNAMediaPlayer, map[string]any{"action": action, "media": miNAMedia})
 }
 
-func (m *MiNAService) PlayerPause(ctx context.Context, deviceID string) (bool, error) {
+func (m *Service) PlayerPause(ctx context.Context, deviceID string) (bool, error) {
 	return m.playerOperation(ctx, deviceID, "pause")
 }
 
-func (m *MiNAService) PlayerStop(ctx context.Context, deviceID string) (bool, error) {
+func (m *Service) PlayerStop(ctx context.Context, deviceID string) (bool, error) {
 	return m.playerOperation(ctx, deviceID, "stop")
 }
 
-func (m *MiNAService) PlayerPlay(ctx context.Context, deviceID string) (bool, error) {
+func (m *Service) PlayerPlay(ctx context.Context, deviceID string) (bool, error) {
 	return m.playerOperation(ctx, deviceID, "play")
 }
 
 // PlayerGetStatus returns decoded data.info when it is JSON, or the raw data otherwise.
-func (m *MiNAService) PlayerGetStatus(ctx context.Context, deviceID string) (any, error) {
+func (m *Service) PlayerGetStatus(ctx context.Context, deviceID string) (any, error) {
 	result, err := m.ubusRequest(ctx, deviceID, "player_get_play_status", miNAMediaPlayer, map[string]any{"media": miNAMedia})
 	if err != nil {
 		return nil, err
@@ -156,7 +161,7 @@ func (m *MiNAService) PlayerGetStatus(ctx context.Context, deviceID string) (any
 	data := result["data"]
 	if info, ok := minaObject(data)["info"].(string); ok {
 		var value any
-		if decodeAccountJSON([]byte(info), &value) == nil {
+		if account.DecodeJSON([]byte(info), &value) == nil {
 			return value, nil
 		}
 	}
@@ -165,12 +170,12 @@ func (m *MiNAService) PlayerGetStatus(ctx context.Context, deviceID string) (any
 
 // PlayerSetLoop sets single-track (0), list (1, default), or random (2) playback
 // for devices using the player_play_url API.
-func (m *MiNAService) PlayerSetLoop(ctx context.Context, deviceID string, loop ...int) (bool, error) {
+func (m *Service) PlayerSetLoop(ctx context.Context, deviceID string, loop ...int) (bool, error) {
 	return m.UbusRequest(ctx, deviceID, "player_set_loop", miNAMediaPlayer, map[string]any{"media": "common", "type": minaOption(1, loop)})
 }
 
 // PlayByURL chooses the playback API based on the speaker hardware.
-func (m *MiNAService) PlayByURL(ctx context.Context, deviceID, audioURL string, typ ...int) (bool, error) {
+func (m *Service) PlayByURL(ctx context.Context, deviceID, audioURL string, typ ...int) (bool, error) {
 	if m == nil {
 		return false, errors.New("MiNA cloud requests require an account")
 	}
@@ -193,12 +198,12 @@ func (m *MiNAService) PlayByURL(ctx context.Context, deviceID, audioURL string, 
 }
 
 // PlayByMusicURL uses player_play_music with the default audio and provider IDs.
-func (m *MiNAService) PlayByMusicURL(ctx context.Context, deviceID, audioURL string, typ ...int) (bool, error) {
+func (m *Service) PlayByMusicURL(ctx context.Context, deviceID, audioURL string, typ ...int) (bool, error) {
 	return m.PlayByMusicURLWithIDs(ctx, deviceID, audioURL, minaOption(2, typ), "1582971365183456177", "355454500")
 }
 
 // PlayByMusicURLWithIDs uses player_play_music with the given audio and provider IDs.
-func (m *MiNAService) PlayByMusicURLWithIDs(ctx context.Context, deviceID, audioURL string, typ int, audioID, cpID string) (bool, error) {
+func (m *Service) PlayByMusicURLWithIDs(ctx context.Context, deviceID, audioURL string, typ int, audioID, cpID string) (bool, error) {
 	audioType := ""
 	if typ == 1 {
 		audioType = "MUSIC"
@@ -259,14 +264,14 @@ func minaTimestamp(value any) (int64, bool) {
 }
 
 // GetLatestAsk returns recent queries and their normalized answers.
-func (m *MiNAService) GetLatestAsk(ctx context.Context, deviceID string) ([]map[string]any, error) {
+func (m *Service) GetLatestAsk(ctx context.Context, deviceID string) ([]map[string]any, error) {
 	result, err := m.ubusRequest(ctx, deviceID, "nlp_result_get", "mibrain", map[string]any{})
 	if err != nil {
 		return nil, err
 	}
 	messages := make([]map[string]any, 0)
 	data := minaObject(result["data"])
-	if !isZeroCode(data["code"]) {
+	if !account.IsZeroCode(data["code"]) {
 		return messages, nil
 	}
 	var payload struct{ Result []json.RawMessage }
@@ -277,7 +282,7 @@ func (m *MiNAService) GetLatestAsk(ctx context.Context, deviceID string) ([]map[
 	for _, entry := range payload.Result {
 		var item struct{ NLP string }
 		var nlp map[string]any
-		if json.Unmarshal(entry, &item) != nil || decodeAccountJSON([]byte(item.NLP), &nlp) != nil || nlp == nil {
+		if json.Unmarshal(entry, &item) != nil || account.DecodeJSON([]byte(item.NLP), &nlp) != nil || nlp == nil {
 			continue
 		}
 		meta := minaObject(nlp["meta"])
@@ -344,7 +349,7 @@ func minaTruthy(value any) bool {
 // SendMessage sets the volume and/or speaks on selected speakers, returning the
 // last device operation's status. A selector of -1 broadcasts to all devices;
 // otherwise the first matching one-based index or cloud TTS-capable device wins.
-func (m *MiNAService) SendMessage(ctx context.Context, devices []map[string]any, devno int, message string, volume *int) (bool, error) {
+func (m *Service) SendMessage(ctx context.Context, devices []map[string]any, devno int, message string, volume *int) (bool, error) {
 	var result bool
 	for i, device := range devices {
 		if devno != -1 && devno != i+1 && !minaTruthy(minaObject(device["capabilities"])["yunduantts"]) {
