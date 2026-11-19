@@ -96,6 +96,13 @@ func run(ctx context.Context, name string, args []string, stdin io.Reader, stdou
 		}),
 	)
 	defer account.Close()
+	if text == "mina" || strings.HasPrefix(text, "mina ") {
+		code, err := runMina(ctx, misgo.NewMiNAService(account), strings.TrimPrefix(text, "mina"), cfg.DID, stdout, stderr)
+		if err != nil {
+			return report(stderr, logger, err)
+		}
+		return code
+	}
 	result, err := misgo.Command(ctx, misgo.NewMiIOService(account, ""), cfg.DID, text, prefix)
 	if err == nil {
 		err = printResult(stdout, result)
@@ -110,7 +117,11 @@ func usage(w io.Writer, prefix string) {
 	fmt.Fprintln(w, "           export MI_PASS=<Password>")
 	fmt.Fprint(w, "           export MI_DID=<Device ID|Name>\n\n")
 	fmt.Fprintln(w, misgo.CommandHelp("", prefix))
-	fmt.Fprint(w, "Local Device (no cloud account, direct LAN control):\n")
+	fmt.Fprintln(w, "MiNA Commands:")
+	for _, item := range minaHelp {
+		fmt.Fprintf(w, "           %smina %-11s%s\n", prefix, item.command, item.description)
+	}
+	fmt.Fprint(w, "\nLocal Device (no cloud account, direct LAN control):\n")
 	fmt.Fprint(w, "           export MI_LOCAL=<IP>:<Token>\n\n")
 	fmt.Fprintln(w, misgo.LocalCommandHelp(prefix))
 }
