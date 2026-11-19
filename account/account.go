@@ -230,7 +230,7 @@ func New(username, password string, options ...Option) *MiAccount {
 }
 
 func (a *MiAccount) Close() error {
-	if a.ownsClient {
+	if a != nil && a.ownsClient {
 		a.client.CloseIdleConnections()
 	}
 	return nil

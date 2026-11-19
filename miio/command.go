@@ -16,7 +16,7 @@ import (
 // A nil service is sufficient for help.
 func (m *Service) Command(ctx context.Context, did, text string, prefix ...string) (any, error) {
 	cmd, arg, hasArg := strings.Cut(text, " ")
-	argv := strings.Split(arg, " ")
+	argv := strings.Fields(arg)
 	at := func(i int) string {
 		if i < len(argv) {
 			return argv[i]
@@ -112,6 +112,9 @@ func (m *Service) Command(ctx context.Context, did, text string, prefix ...strin
 	case write:
 		return m.MiIOSetProps(ctx, did, props)
 	case miot && arg != "":
+		if len(ids) > 1 {
+			return "Invalid command: " + cmd, nil
+		}
 		id, err := ParseIID(ids[0])
 		if err != nil {
 			return nil, err
@@ -147,7 +150,7 @@ Do Action: %[1]s<siid[-piid]> <arg1|[]> [...]
            %[1]s5 Hello
            %[1]s5-4 Hello 1
 
-Call MIoT: %[1]s<cmd=prop/get|/prop/set|action> <params>
+Call MIoT: %[1]s<cmd=prop/get|prop/set|action> <params>
            %[1]saction %[2]s{"did":%[3]q,"siid":5,"aiid":1,"in":["Hello"]}%[2]s
 
 Call MiIO: %[1]s/<uri> <data>

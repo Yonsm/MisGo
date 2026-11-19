@@ -33,11 +33,11 @@ func ConfigFromEnv() Config {
 
 // LocalTarget splits the MI_LOCAL setting into its address and token.
 func (c Config) LocalTarget() (address, token string, err error) {
-	address, token, ok := strings.Cut(c.Local, ":")
-	if !ok || address == "" || token == "" {
+	i := strings.LastIndex(c.Local, ":")
+	if i <= 0 || i == len(c.Local)-1 {
 		return "", "", errors.New("MI_LOCAL must be <IP>:<Token>")
 	}
-	return address, token, nil
+	return c.Local[:i], c.Local[i+1:], nil
 }
 
 // HomeTokenPath returns the CLI's Python-compatible token cache path.

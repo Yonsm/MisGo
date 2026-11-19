@@ -33,14 +33,17 @@ func ParseValue(text string) any {
 	case "false":
 		return false
 	}
-	if text != "" && strings.Trim(text, "0123456789") == "" {
+	if digits := strings.TrimPrefix(text, "-"); digits != "" && strings.Trim(digits, "0123456789") == "" {
 		if n, err := strconv.ParseInt(text, 10, 64); err == nil {
 			return n
 		}
-		return json.Number(strings.TrimLeft(text, "0"))
+		if strings.HasPrefix(text, "-") {
+			return json.Number("-" + strings.TrimLeft(digits, "0"))
+		}
+		return json.Number(strings.TrimLeft(digits, "0"))
 	}
 	if value, err := strconv.ParseFloat(strings.TrimSpace(text), 64); err == nil &&
-		!strings.ContainsAny(text, "xX") && !math.IsNaN(value) && !math.IsInf(value, 0) {
+		!strings.ContainsAny(text, "xX_") && !math.IsNaN(value) && !math.IsInf(value, 0) {
 		s := strconv.FormatFloat(value, 'g', -1, 64)
 		if !strings.ContainsAny(s, ".eE") {
 			s += ".0"

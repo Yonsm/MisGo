@@ -28,6 +28,8 @@ const (
 	specMaxSize = 32 << 20
 )
 
+var defaultHTTPClient = &http.Client{Timeout: 15 * time.Second}
+
 // DefaultIndexCachePath returns the MiService-compatible temp-file cache path
 // for the full model-to-URN index.
 func DefaultIndexCachePath() string {
@@ -83,9 +85,10 @@ type specIndexLoad struct {
 }
 
 type specInstanceLoad struct {
-	done chan struct{}
-	raw  json.RawMessage
-	err  error
+	done      chan struct{}
+	raw       json.RawMessage
+	err       error
+	abandoned bool
 }
 
 // New creates a spec Client with the given options.
@@ -117,29 +120,40 @@ func (s *Client) Raw(ctx context.Context, model string) (json.RawMessage, error)
 }
 
 func (s *Client) rawCached(ctx context.Context, model string) (json.RawMessage, error) {
-	s.instMu.Lock()
-	if s.instances == nil {
-		s.instances = readJSONCache[json.RawMessage](s.instanceCachePath)
-	}
-	if cached := s.instances[model]; len(cached) > 0 && cached[0] == '{' {
-		s.instMu.Unlock()
-		return bytes.Clone(cached), nil
-	}
-	if s.instanceLoads == nil {
-		s.instanceLoads = make(map[string]*specInstanceLoad)
-	}
-	if pending := s.instanceLoads[model]; pending != nil {
+	var pending *specInstanceLoad
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		s.instMu.Lock()
+		if s.instances == nil {
+			s.instances = readJSONCache[json.RawMessage](s.instanceCachePath)
+		}
+		if cached := s.instances[model]; len(cached) > 0 && cached[0] == '{' {
+			s.instMu.Unlock()
+			return bytes.Clone(cached), nil
+		}
+		if s.instanceLoads == nil {
+			s.instanceLoads = make(map[string]*specInstanceLoad)
+		}
+		pending = s.instanceLoads[model]
+		if pending == nil {
+			pending = &specInstanceLoad{done: make(chan struct{})}
+			s.instanceLoads[model] = pending
+			s.instMu.Unlock()
+			break
+		}
 		s.instMu.Unlock()
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-pending.done:
+			if pending.abandoned {
+				continue
+			}
 			return bytes.Clone(pending.raw), pending.err
 		}
 	}
-	pending := &specInstanceLoad{done: make(chan struct{})}
-	s.instanceLoads[model] = pending
-	s.instMu.Unlock()
 
 	raw, isInstance, err := s.fetchRaw(ctx, model)
 	s.instMu.Lock()
@@ -148,6 +162,7 @@ func (s *Client) rawCached(ctx context.Context, model string) (json.RawMessage, 
 		writeJSONCache(s.instanceCachePath, s.instances)
 	}
 	pending.raw, pending.err = raw, err
+	pending.abandoned = err != nil && ctx.Err() != nil
 	delete(s.instanceLoads, model)
 	close(pending.done)
 	s.instMu.Unlock()
@@ -226,7 +241,7 @@ func (s *Client) httpClient() *http.Client {
 	if s.http != nil {
 		return s.http
 	}
-	return &http.Client{Timeout: 15 * time.Second}
+	return defaultHTTPClient
 }
 
 func (s *Client) fetch(ctx context.Context, endpoint string, dest any) error {

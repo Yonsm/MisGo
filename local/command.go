@@ -3,6 +3,7 @@ package local
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"unicode"
@@ -36,6 +37,9 @@ func (s *Service) Command(ctx context.Context, text string, prefix ...string) (a
 	case "", "?", "？", "help", "-h", "--help":
 		return Help(prefix...), nil
 	}
+	if s == nil {
+		return nil, errors.New("miio: local command requires a device service")
+	}
 	if method, ok := strings.CutPrefix(cmd, "/"); ok {
 		if arg == "" {
 			return s.Send(ctx, method, nil)
@@ -47,29 +51,40 @@ func (s *Service) Command(ctx context.Context, text string, prefix ...string) (a
 		return s.Send(ctx, method, params)
 	}
 	items := strings.Split(cmd, ",")
-	if !strings.Contains(items[0], "=") {
-		if isNumeric(items[0]) && arg != "" {
-			id, err := ParseIID(items[0])
-			if err != nil {
-				return nil, err
-			}
-			args := []any{}
-			if arg != "[]" {
-				for _, value := range strings.Fields(arg) {
-					args = append(args, command.ParseValue(value))
-				}
-			}
-			return s.MIoTAction(ctx, id, args)
-		}
-		return s.MiIOGetProps(ctx, items)
-	}
-	props := make([]Property, 0, len(items))
-	for _, item := range items {
-		name, value, ok := strings.Cut(item, "=")
-		if !ok {
+	write := strings.Contains(items[0], "=")
+	ids := make([]string, len(items))
+	var props []Property
+	for i, item := range items {
+		name, value, hasValue := strings.Cut(item, "=")
+		if hasValue != write {
 			return "Invalid command: " + cmd, nil
 		}
-		props = append(props, Property{Name: name, Value: command.ParseValue(value)})
+		if name == "" {
+			return nil, fmt.Errorf("miio: missing property identifier in %q", cmd)
+		}
+		ids[i] = name
+		if write {
+			props = append(props, Property{Name: name, Value: command.ParseValue(value)})
+		}
 	}
-	return s.MiIOSetProps(ctx, props)
+	if write {
+		return s.MiIOSetProps(ctx, props)
+	}
+	if isNumeric(ids[0]) && arg != "" {
+		if len(ids) > 1 {
+			return "Invalid command: " + cmd, nil
+		}
+		id, err := ParseIID(ids[0])
+		if err != nil {
+			return nil, err
+		}
+		args := []any{}
+		if arg != "[]" {
+			for _, value := range strings.Fields(arg) {
+				args = append(args, command.ParseValue(value))
+			}
+		}
+		return s.MIoTAction(ctx, id, args)
+	}
+	return s.MiIOGetProps(ctx, ids)
 }

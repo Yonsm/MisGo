@@ -44,7 +44,7 @@ func runMina(ctx context.Context, service minaDeviceService, text, did string, s
 	if err != nil {
 		return 1, err
 	}
-	if devices == nil || len(devices) == 0 && strings.TrimSpace(text) == "" {
+	if len(devices) == 0 {
 		fmt.Fprintln(stderr, "No devices found")
 		return 1, nil
 	}

@@ -154,6 +154,9 @@ func (d *Service) lock(ctx context.Context) error {
 // Hello refreshes the device ID and its clock. Send does this automatically
 // before the first request and retries once after a stale-session failure.
 func (d *Service) Hello(ctx context.Context) error {
+	if d == nil {
+		return errors.New("miio: local command requires a device service")
+	}
 	if err := d.lock(ctx); err != nil {
 		return err
 	}
@@ -233,6 +236,9 @@ func (d *Service) checksum(packet []byte) []byte {
 // If a cached handshake stamp has drifted or the device rebooted, Send refreshes
 // the handshake and retries once automatically.
 func (d *Service) Send(ctx context.Context, method string, params any) (any, error) {
+	if d == nil {
+		return nil, errors.New("miio: local command requires a device service")
+	}
 	if method == "" {
 		return nil, errors.New("miio: missing local method")
 	}
@@ -332,7 +338,7 @@ func (d *Service) decodeResponse(packet []byte, id uint32) (any, json.RawMessage
 		Result any             `json:"result"`
 		Error  json.RawMessage `json:"error"`
 	}
-	data := body[:len(body)-padding]
+	data := bytes.TrimRight(body[:len(body)-padding], "\x00")
 	if !json.Valid(data) {
 		return nil, nil, errors.New("invalid JSON response")
 	}
@@ -497,6 +503,11 @@ func (d *Service) MiIOGetProps(ctx context.Context, iids []string) ([]any, error
 	if len(iids) == 0 {
 		return []any{}, nil
 	}
+	for _, s := range iids {
+		if s == "" {
+			return nil, errors.New("miio: missing property identifier")
+		}
+	}
 	if isNumeric(iids[0]) {
 		parsed := make([]IID, len(iids))
 		for i, s := range iids {
@@ -515,6 +526,11 @@ func (d *Service) MiIOGetProps(ctx context.Context, iids []string) ([]any, error
 func (d *Service) MiIOSetProps(ctx context.Context, props []Property) ([]any, error) {
 	if len(props) == 0 {
 		return []any{}, nil
+	}
+	for _, p := range props {
+		if p.Name == "" {
+			return nil, errors.New("miio: missing property identifier")
+		}
 	}
 	if isNumeric(props[0].Name) {
 		parsed := make([]MIoTProperty, len(props))

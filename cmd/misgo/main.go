@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -34,21 +35,21 @@ func main() {
 
 func run(ctx context.Context, name string, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	verbosity := 3
-	if len(args) > 0 && strings.HasPrefix(args[0], "-v") {
+	if len(args) > 0 && strings.HasPrefix(args[0], "-v") && args[0] != "-version" {
 		verbosity = 4
-		if len(args[0]) > 2 {
-			digit := args[0][2]
-			if digit < '0' || digit > '9' {
-				fmt.Fprintf(stderr, "ValueError: invalid literal for int() with base 10: '%c'\n", digit)
+		if suffix := args[0][2:]; suffix != "" {
+			n, err := strconv.Atoi(suffix)
+			if err != nil || n < 0 {
+				fmt.Fprintf(stderr, "Error: invalid verbosity flag %q (use -v or -v0..-v5)\n", args[0])
 				return 1
 			}
-			verbosity = min(int(digit-'0'), 5)
+			verbosity = min(n, 5)
 		}
 		args = args[1:]
 	}
 	if len(args) > 0 {
 		switch args[0] {
-		case "version", "--version", "-V":
+		case "version", "--version", "-version", "-V":
 			fmt.Fprintf(stdout, "misgo %s\n", Version)
 			return 0
 		}
@@ -70,15 +71,15 @@ func run(ctx context.Context, name string, args []string, stdin io.Reader, stdou
 		}
 		svc, err := local.New(address, token)
 		if err != nil {
-			return report(stderr, logger, err)
+			return report(stderr, err)
 		}
 		result, err := svc.Command(ctx, text, prefix)
-		return reportResult(stdout, stderr, logger, result, err)
+		return reportResult(stdout, stderr, result, err)
 	}
 	cmd, arg, _ := strings.Cut(text, " ")
 	if cmd == "spec" || cmd == "decode" {
 		var argv [4]string
-		copy(argv[:], strings.SplitN(arg, " ", len(argv)+1))
+		copy(argv[:], strings.Fields(arg))
 		var result any
 		var err error
 		if cmd == "spec" {
@@ -88,11 +89,11 @@ func run(ctx context.Context, name string, args []string, stdin io.Reader, stdou
 		} else {
 			result, err = decode.Decode(argv[0], argv[1], argv[2], argv[3] == "gzip")
 		}
-		return reportResult(stdout, stderr, logger, result, err)
+		return reportResult(stdout, stderr, result, err)
 	}
 	path, err := HomeTokenPath()
 	if err != nil {
-		return report(stderr, logger, err)
+		return report(stderr, err)
 	}
 	reader := bufio.NewReader(stdin)
 	acct := account.New(cfg.Username, cfg.Password,
@@ -127,12 +128,12 @@ func run(ctx context.Context, name string, args []string, stdin io.Reader, stdou
 	if text == "mina" || strings.HasPrefix(text, "mina ") {
 		code, err := runMina(ctx, mina.New(acct), strings.TrimPrefix(text, "mina"), cfg.DID, stdout, stderr)
 		if err != nil {
-			return report(stderr, logger, err)
+			return report(stderr, err)
 		}
 		return code
 	}
 	result, err := miio.New(acct, "").Command(ctx, cfg.DID, text, prefix)
-	return reportResult(stdout, stderr, logger, result, err)
+	return reportResult(stdout, stderr, result, err)
 }
 
 func usage(w io.Writer, prefix string) {
@@ -173,20 +174,19 @@ func printJSON(w io.Writer, value any) error {
 	return err
 }
 
-func report(w io.Writer, logger *slog.Logger, err error) int {
+func report(w io.Writer, err error) int {
 	if err == nil {
 		return 0
 	}
-	logger.Error("Error: " + err.Error())
-	fmt.Fprintln(w, err)
+	fmt.Fprintln(w, "Error:", err)
 	return 1
 }
 
-func reportResult(stdout, stderr io.Writer, logger *slog.Logger, value any, err error) int {
+func reportResult(stdout, stderr io.Writer, value any, err error) int {
 	if err == nil {
 		err = printResult(stdout, value)
 	}
-	return report(stderr, logger, err)
+	return report(stderr, err)
 }
 
 func newLogHandler(w io.Writer, level slog.Level) slog.Handler {
