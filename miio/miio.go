@@ -335,21 +335,14 @@ func (m *Service) HomeGetProp(ctx context.Context, did, prop string) (any, error
 	return firstProperty(m.HomeGetProps(ctx, did, []string{prop}))
 }
 
-func legacySetParams(value any) (json.RawMessage, error) {
+func (m *Service) HomeSetProp(ctx context.Context, did, prop string, value any) (any, error) {
 	payload, err := json.Marshal(value)
 	if err != nil {
 		return nil, err
 	}
-	if bytes.TrimSpace(payload)[0] == '[' {
-		return payload, nil
-	}
-	return append(append([]byte{'['}, payload...), ']'), nil
-}
-
-func (m *Service) HomeSetProp(ctx context.Context, did, prop string, value any) (any, error) {
-	params, err := legacySetParams(value)
-	if err != nil {
-		return nil, err
+	params := json.RawMessage(payload)
+	if bytes.TrimSpace(payload)[0] != '[' {
+		params = append(append([]byte{'['}, payload...), ']')
 	}
 	result, err := firstProperty(miIOListResult(m.HomeRequest(ctx, did, "set_"+prop, params)))
 	if result == "ok" {

@@ -374,17 +374,6 @@ func (d *Service) GetProp(ctx context.Context, prop string) (any, error) {
 	return values[0], nil
 }
 
-func legacySetParams(value any) (json.RawMessage, error) {
-	payload, err := json.Marshal(value)
-	if err != nil {
-		return nil, err
-	}
-	if bytes.TrimSpace(payload)[0] == '[' {
-		return payload, nil
-	}
-	return append(append([]byte{'['}, payload...), ']'), nil
-}
-
 // SetProps writes legacy MiIO properties in order, stopping on the first error.
 func (d *Service) SetProps(ctx context.Context, props []Property) ([]any, error) {
 	results := make([]any, 0, len(props))
@@ -402,9 +391,13 @@ func (d *Service) SetProps(ctx context.Context, props []Property) ([]any, error)
 // directly; other values are wrapped in a list. A response starting with "ok"
 // is returned as 0.
 func (d *Service) SetProp(ctx context.Context, prop string, value any) (any, error) {
-	params, err := legacySetParams(value)
+	payload, err := json.Marshal(value)
 	if err != nil {
 		return nil, err
+	}
+	params := json.RawMessage(payload)
+	if bytes.TrimSpace(payload)[0] != '[' {
+		params = append(append([]byte{'['}, payload...), ']')
 	}
 	result, err := d.Send(ctx, "set_"+prop, params)
 	if values, ok := result.([]any); ok && len(values) > 0 && values[0] == "ok" {
@@ -580,7 +573,8 @@ func localString(v any) string {
 }
 
 func matchMIoTValues(list []any, ids []IID) ([]any, error) {
-	var out []any
+	out := make([]any, len(ids))
+	matched := false
 	for n, id := range ids {
 		expected := id.String()
 		for i, raw := range list {
@@ -588,30 +582,27 @@ func matchMIoTValues(list []any, ids []IID) ([]any, error) {
 			if !ok {
 				continue
 			}
-			siid := localInt(p["siid"], 0)
-			piid := localInt(p["piid"], 0)
-			respDID := localString(p["did"])
-			if siid != 0 || piid != 0 {
-				if siid != id.SIID || piid != id.PIID || (respDID != "" && respDID != expected) {
+			siid, piid := localInt(p["siid"], 0), localInt(p["piid"], 0)
+			did := localString(p["did"])
+			switch {
+			case siid != 0 || piid != 0:
+				if siid != id.SIID || piid != id.PIID || (did != "" && did != expected) {
 					continue
 				}
-			} else if respDID != "" {
-				if respDID != expected {
+			case did != "":
+				if did != expected {
 					continue
 				}
-			} else if i != n {
+			case i != n:
 				continue
 			}
 			if localInt(p["code"], -1) == 0 {
-				if out == nil {
-					out = make([]any, len(ids))
-				}
-				out[n] = p["value"]
+				out[n], matched = p["value"], true
 			}
 			break
 		}
 	}
-	if out == nil {
+	if !matched {
 		return nil, errors.New("miio: local device returned no successful MIoT properties")
 	}
 	return out, nil

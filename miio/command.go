@@ -16,10 +16,7 @@ import (
 // A nil service is sufficient for help.
 func (m *Service) Command(ctx context.Context, did, text string, prefix ...string) (any, error) {
 	cmd, arg, hasArg := strings.Cut(text, " ")
-	var argv []string
-	if arg != "" {
-		argv = strings.Split(arg, " ")
-	}
+	argv := strings.Split(arg, " ")
 	at := func(i int) string {
 		if i < len(argv) {
 			return argv[i]

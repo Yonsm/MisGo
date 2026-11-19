@@ -66,10 +66,7 @@ func run(ctx context.Context, name string, args []string, stdin io.Reader, stdou
 			return report(stderr, logger, err)
 		}
 		result, err := svc.Command(ctx, text, prefix)
-		if err == nil {
-			err = printResult(stdout, result)
-		}
-		return report(stderr, logger, err)
+		return reportResult(stdout, stderr, logger, result, err)
 	}
 	cmd, arg, _ := strings.Cut(text, " ")
 	if cmd == "spec" || cmd == "decode" {
@@ -84,10 +81,7 @@ func run(ctx context.Context, name string, args []string, stdin io.Reader, stdou
 		} else {
 			result, err = decode.Decode(argv[0], argv[1], argv[2], argv[3] == "gzip")
 		}
-		if err == nil {
-			err = printResult(stdout, result)
-		}
-		return report(stderr, logger, err)
+		return reportResult(stdout, stderr, logger, result, err)
 	}
 	path, err := HomeTokenPath()
 	if err != nil {
@@ -131,10 +125,7 @@ func run(ctx context.Context, name string, args []string, stdin io.Reader, stdou
 		return code
 	}
 	result, err := miio.New(acct, "").Command(ctx, cfg.DID, text, prefix)
-	if err == nil {
-		err = printResult(stdout, result)
-	}
-	return report(stderr, logger, err)
+	return reportResult(stdout, stderr, logger, result, err)
 }
 
 func usage(w io.Writer, prefix string) {
@@ -180,6 +171,13 @@ func report(w io.Writer, logger *slog.Logger, err error) int {
 	logger.Error("Error: " + err.Error())
 	fmt.Fprintln(w, err)
 	return 1
+}
+
+func reportResult(stdout, stderr io.Writer, logger *slog.Logger, value any, err error) int {
+	if err == nil {
+		err = printResult(stdout, value)
+	}
+	return report(stderr, logger, err)
 }
 
 func newLogHandler(w io.Writer, level slog.Level) slog.Handler {
