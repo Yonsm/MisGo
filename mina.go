@@ -266,7 +266,7 @@ func (m *MiNAService) GetLatestAsk(ctx context.Context, deviceID string) ([]map[
 	}
 	messages := make([]map[string]any, 0)
 	data := minaObject(result["data"])
-	if data["code"] != json.Number("0") {
+	if !isZeroCode(data["code"]) {
 		return messages, nil
 	}
 	var payload struct{ Result []json.RawMessage }

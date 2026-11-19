@@ -20,6 +20,9 @@ import (
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	code := run(ctx, filepath.Base(os.Args[0]), os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
+	if ctx.Err() != nil {
+		code = 130
+	}
 	cancel()
 	os.Exit(code)
 }

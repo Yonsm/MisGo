@@ -306,6 +306,18 @@ func validServiceToken(sid string, token ServiceToken) bool {
 	return true
 }
 
+func isZeroCode(v any) bool {
+	switch n := v.(type) {
+	case json.Number:
+		f, err := n.Float64()
+		return err == nil && f == 0
+	case bool:
+		return !n // Python considers False equal to 0.
+	default:
+		return false
+	}
+}
+
 func accountCode(code *int) int {
 	if code == nil {
 		return -1
@@ -417,7 +429,7 @@ func (a *MiAccount) session(ctx context.Context, sid string, rejected *MiToken) 
 				return nil, ctx.Err()
 			}
 			a.log(ctx, slog.LevelWarn, "Could not load Xiaomi token cache")
-		} else if token != nil && token.DeviceID != "" && accountString(token.UserID) != "" && (token.Username == "" || a.username == token.Username) {
+		} else if token != nil && token.DeviceID != "" && accountString(token.UserID) != "" && (token.Username == "" || a.username == "" || a.username == token.Username) {
 			a.token = token
 		}
 		a.loaded = true
@@ -826,15 +838,34 @@ func (a *MiAccount) verifyOTP(ctx context.Context, client *http.Client, base *ur
 // retrying once with fresh credentials if the service rejects the token.
 // A nil form selects GET; otherwise it uses POST.
 func (a *MiAccount) MiRequest(ctx context.Context, sid, address string, form url.Values, headers http.Header) (map[string]any, error) {
-	return a.miRequest(ctx, sid, address, headers, func(*MiToken) (url.Values, []*http.Cookie, error) {
+	return a.MiRequestWith(ctx, sid, address, headers, true, func(MiRequestSession) (url.Values, []*http.Cookie, error) {
 		return form, nil, nil
 	})
 }
 
-func (a *MiAccount) miRequest(ctx context.Context, sid, address string, headers http.Header, prepare func(*MiToken) (url.Values, []*http.Cookie, error)) (map[string]any, error) {
+// MiRequestSession contains the values needed to sign a Xiaomi service request.
+// It does not expose the account's passToken or any service authentication cookie.
+type MiRequestSession struct {
+	DeviceID  string
+	UserID    string
+	SSecurity string
+}
+
+// MiRequestWith prepares a signed request and optional extra cookies. It calls
+// prepare again with the fresh session if retryAuth is true and login is retried.
+// A nil form selects GET; a non-nil form selects POST.
+func (a *MiAccount) MiRequestWith(ctx context.Context, sid, address string, headers http.Header, retryAuth bool, prepare func(MiRequestSession) (url.Values, []*http.Cookie, error)) (map[string]any, error) {
+	if prepare == nil {
+		return nil, errors.New("missing Xiaomi request preparation callback")
+	}
 	u, err := url.Parse(address)
 	if err != nil || !trustedServiceURL(u) {
 		return nil, errors.New("invalid Xiaomi service URL")
+	}
+	host := u.Hostname()
+	isMiIO := host == "api.io.mi.com" || strings.HasSuffix(host, ".api.io.mi.com")
+	if sid == miIOSID && !isMiIO || sid == miNASID && isMiIO {
+		return nil, errors.New("Xiaomi service ID does not match the API host")
 	}
 	var rejected *MiToken
 	client := *a.client
@@ -855,7 +886,7 @@ func (a *MiAccount) miRequest(ctx context.Context, sid, address string, headers 
 		if err != nil {
 			return nil, err
 		}
-		form, cookies, err := prepare(t)
+		form, cookies, err := prepare(MiRequestSession{t.DeviceID, accountString(t.UserID), t.Services[sid].SSecurity})
 		if err != nil {
 			return nil, err
 		}
@@ -863,11 +894,22 @@ func (a *MiAccount) miRequest(ctx context.Context, sid, address string, headers 
 		if err != nil {
 			return nil, err
 		}
-		for _, c := range cookies {
-			req.AddCookie(c)
-		}
+		// Rebuild the Cookie header so extras cannot shadow the session identity.
+		extra := req.Cookies()
+		req.Header.Del("Cookie")
 		req.AddCookie(&http.Cookie{Name: "userId", Value: accountString(t.UserID)})
 		req.AddCookie(&http.Cookie{Name: "serviceToken", Value: t.Services[sid].ServiceToken})
+		addExtra := func(c *http.Cookie) {
+			if c != nil && !strings.EqualFold(c.Name, "userId") && !strings.EqualFold(c.Name, "serviceToken") {
+				req.AddCookie(c)
+			}
+		}
+		for _, c := range extra {
+			addExtra(c)
+		}
+		for _, c := range cookies {
+			addExtra(c)
+		}
 		resp, err := doAccountHTTP(&client, req)
 		if err != nil {
 			return nil, err
@@ -887,19 +929,18 @@ func (a *MiAccount) miRequest(ctx context.Context, sid, address string, headers 
 			if decodeAccountJSON(body, &result) != nil {
 				return nil, errors.New("invalid Xiaomi service JSON response")
 			}
-			code, _ := result["code"].(json.Number)
-			if code == "0" {
+			if isZeroCode(result["code"]) {
 				return result, nil
-			}
-			n, convErr := code.Int64()
-			if convErr != nil {
-				n = -1
 			}
 			message, _ := result["message"].(string)
 			auth = strings.Contains(strings.ToLower(message), "auth")
-			err = fmt.Errorf("Xiaomi service request failed (code=%d)", n)
+			code, ok := result["code"].(json.Number)
+			if !ok {
+				code = "-1"
+			}
+			err = fmt.Errorf("Xiaomi service request failed (code=%s)", code)
 		}
-		if !auth || attempt == 1 {
+		if !retryAuth || !auth || attempt == 1 {
 			return nil, err
 		}
 		a.log(ctx, slog.LevelWarn, "Xiaomi service rejected token; retrying login", "sid", sid)

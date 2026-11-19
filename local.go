@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -341,13 +340,13 @@ func (d *MiIOLocalService) SetProps(ctx context.Context, props []LocalProperty) 
 	return results, nil
 }
 
-// SetProp writes a legacy MiIO property. An array or slice supplies the method
-// arguments directly (except byte slices); other values are wrapped in a list.
-// A response starting with "ok" is returned as 0.
+// SetProp writes a legacy MiIO property. JSON arrays supply the method arguments
+// directly; other values are wrapped in a list. A response starting with "ok"
+// is returned as 0.
 func (d *MiIOLocalService) SetProp(ctx context.Context, prop string, value any) (any, error) {
-	params := any([]any{value})
-	if t := reflect.TypeOf(value); t != nil && (t.Kind() == reflect.Array || (t.Kind() == reflect.Slice && t.Elem().Kind() != reflect.Uint8)) {
-		params = value
+	params, err := legacySetParams(value)
+	if err != nil {
+		return nil, err
 	}
 	result, err := d.Send(ctx, "set_"+prop, params)
 	if values, ok := result.([]any); ok && len(values) > 0 && values[0] == "ok" {

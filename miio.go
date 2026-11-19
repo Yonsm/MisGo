@@ -1,6 +1,7 @@
 package misgo
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -13,7 +14,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -116,9 +116,9 @@ func (m *MiIOService) MiIORequest(ctx context.Context, uri string, data any) (an
 	headers := make(http.Header)
 	headers.Set("User-Agent", UAMiIO)
 	headers.Set("x-xiaomi-protocal-flag-cli", "PROTOCAL-HTTP2")
-	response, err := m.Account.miRequest(ctx, miIOSID, srv+uri, headers, func(t *MiToken) (url.Values, []*http.Cookie, error) {
-		form, err := SignData(uri, data, t.Services[miIOSID].SSecurity)
-		return form, []*http.Cookie{{Name: "PassportDeviceId", Value: t.DeviceID}}, err
+	response, err := m.Account.MiRequestWith(ctx, miIOSID, srv+uri, headers, true, func(session MiRequestSession) (url.Values, []*http.Cookie, error) {
+		form, err := SignData(uri, data, session.SSecurity)
+		return form, []*http.Cookie{{Name: "PassportDeviceId", Value: session.DeviceID}}, err
 	})
 	if err != nil {
 		return nil, err
@@ -166,24 +166,23 @@ func parsePropertyIDs(iids []string) ([]IID, bool, error) {
 	if len(iids) == 0 {
 		return nil, false, nil
 	}
-	miot := numericIID(iids[0])
-	var parsed []IID
-	if miot {
-		parsed = make([]IID, len(iids))
+	for _, id := range iids {
+		if id == "" {
+			return nil, false, errors.New("missing MiIO/MIoT property identifier")
+		}
 	}
+	if !numericIID(iids[0]) {
+		return nil, false, nil
+	}
+	parsed := make([]IID, len(iids))
 	for i, id := range iids {
-		if id == "" || numericIID(id) != miot {
-			return nil, false, errors.New("invalid or mixed MiIO/MIoT property identifiers")
-		}
-		if miot {
-			var err error
-			parsed[i], err = ParseIID(id)
-			if err != nil {
-				return nil, false, err
-			}
+		var err error
+		parsed[i], err = ParseIID(id)
+		if err != nil {
+			return nil, false, err
 		}
 	}
-	return parsed, miot, nil
+	return parsed, true, nil
 }
 
 func (m *MiIOService) MiIOGetProps(ctx context.Context, did string, iids []string) ([]any, error) {
@@ -273,13 +272,23 @@ func (m *MiIOService) HomeGetProp(ctx context.Context, did, prop string) (any, e
 	return firstProperty(m.HomeGetProps(ctx, did, []string{prop}))
 }
 
+// legacySetParams normalizes the JSON representation, not the Go representation:
+// only an array supplies the entire argument list.
+func legacySetParams(value any) (json.RawMessage, error) {
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	if bytes.TrimSpace(payload)[0] == '[' {
+		return payload, nil
+	}
+	return append(append([]byte{'['}, payload...), ']'), nil
+}
+
 func (m *MiIOService) HomeSetProp(ctx context.Context, did, prop string, value any) (any, error) {
-	params := value
-	kind := reflect.ValueOf(value).Kind()
-	if kind != reflect.Slice && kind != reflect.Array {
-		params = []any{value}
-	} else if kind == reflect.Slice && reflect.ValueOf(value).IsNil() {
-		params = []any{}
+	params, err := legacySetParams(value)
+	if err != nil {
+		return nil, err
 	}
 	result, err := firstProperty(miIOListResult(m.HomeRequest(ctx, did, "set_"+prop, params)))
 	if result == "ok" {
@@ -357,6 +366,9 @@ func (m *MiIOService) MIoTAction(ctx context.Context, did string, id IID, args [
 }
 
 func miIOCode(v any) int {
+	if isZeroCode(v) {
+		return 0
+	}
 	if n, ok := v.(json.Number); ok {
 		if code, err := strconv.Atoi(string(n)); err == nil {
 			return code

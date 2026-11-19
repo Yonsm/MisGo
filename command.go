@@ -236,7 +236,11 @@ func parseCommandValue(text string) any {
 	}
 	if value, err := strconv.ParseFloat(strings.TrimSpace(text), 64); err == nil &&
 		!strings.ContainsAny(text, "xX") && !math.IsNaN(value) && !math.IsInf(value, 0) {
-		return value
+		s := strconv.FormatFloat(value, 'g', -1, 64)
+		if !strings.ContainsAny(s, ".eE") {
+			s += ".0"
+		}
+		return json.Number(s)
 	}
 	return text
 }
@@ -251,8 +255,9 @@ func commandTruthy(value any) bool {
 		return v
 	case int64:
 		return v != 0
-	case float64:
-		return v != 0
+	case json.Number:
+		n, _ := v.Float64()
+		return n != 0
 	default:
 		return true
 	}

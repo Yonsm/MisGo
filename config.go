@@ -4,6 +4,7 @@ package misgo
 import (
 	"errors"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 )
@@ -43,7 +44,11 @@ func (c Config) LocalTarget() (address, token string, err error) {
 func HomeTokenPath() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", err
+		current, userErr := user.Current()
+		if userErr != nil || current.HomeDir == "" {
+			return "", err
+		}
+		home = current.HomeDir
 	}
 	return filepath.Join(home, DefaultTokenPath), nil
 }
