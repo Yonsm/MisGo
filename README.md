@@ -2,16 +2,18 @@
 
 MisGo 是 [MiService](https://github.com/Yonsm/MiService) 的 Go 实现，提供小米账号、米家设备和小爱音箱的 Go 库，以及兼容 MiService 命令语法的 `misgo`。仅使用 Go 标准库。
 
+[![CI](https://github.com/Yonsm/MisGo/actions/workflows/ci.yml/badge.svg)](https://github.com/Yonsm/MisGo/actions/workflows/ci.yml)
+
 ## 安装
 
 需要 Go 1.23 或更高版本：
 
 ```sh
 go install github.com/Yonsm/misgo/cmd/misgo@latest
-misgo
+misgo version
 ```
 
-在源码目录构建：`go build -o misgo ./cmd/misgo`。
+在源码目录构建：`go build -o misgo ./cmd/misgo`。也可以从 GitHub Releases 下载 macOS、Linux 和 Windows 的预编译二进制。
 
 ## 命令行
 
@@ -23,7 +25,7 @@ misgo
 
 CLI 使用 `~/.mi.token`，读取 MiService 的缓存格式，并以仅当前用户可读写的权限原子写入。未设置 `MI_USER` 时，有效缓存决定操作的是哪个账号。旧版缓存可能不含账号标识；切换账号前请移走旧缓存，自动化任务请使用独立的缓存。不要分享缓存，也不要把密码、设备 token 或 `list` 的输出提交到 Git。
 
-`misgo` 不带参数显示完整帮助；`misgo --help`（也可用 `help`、`?`、`？`）显示当前云端或局域网模式的命令帮助。前置 `-v0` 到 `-v5` 分别表示关闭日志、严重、错误、警告、信息、调试；默认 `-v3`，单独 `-v` 等同 `-v4`。
+`misgo` 不带参数显示完整帮助；`misgo --help`（也可用 `help`、`?`、`？`）显示当前云端或局域网模式的命令帮助；`misgo version`（也可用 `--version`、`-V`）输出版本。前置 `-v0` 到 `-v5` 分别表示关闭日志、严重、错误、警告、信息、调试；默认 `-v3`，单独 `-v` 等同 `-v4`。
 
 ### MiIO / MIoT 云端
 
@@ -66,7 +68,7 @@ misgo spec urn:miot-spec-v2:device:speaker:0000A015:xiaomi-lx04:1
 misgo decode "$SSECURITY" "$NONCE" "$CIPHERTEXT" gzip
 ```
 
-`spec` 访问公开的 `miot-spec.org`，不需要登录；`decode` 完全离线，`gzip` 可省略。命令行参数可能被本机进程列表看到；在共享主机上处理敏感密钥时建议调用 Go 库的 `Decode`。
+`spec` 访问公开的 `miot-spec.org`，不需要登录；`decode` 完全离线，`gzip` 可省略。命令行参数可能被本机进程列表看到；在共享主机上处理敏感密钥时建议调用 `miio/decode` 包的 `Decode`。
 
 ### 小爱音箱（MiNA）
 
@@ -109,22 +111,22 @@ import (
     "fmt"
     "log"
     "os"
+    "path/filepath"
 
-    "github.com/Yonsm/misgo"
+    "github.com/Yonsm/misgo/account"
+    "github.com/Yonsm/misgo/miio"
 )
 
 func main() {
-    ctx := context.Background()
-    path, err := misgo.HomeTokenPath()
+    home, err := os.UserHomeDir()
     if err != nil {
         log.Fatal(err)
     }
-    account := misgo.NewMiAccount(os.Getenv("MI_USER"), os.Getenv("MI_PASS"),
-        misgo.WithTokenPath(path))
-    defer account.Close()
+    acct := account.New(os.Getenv("MI_USER"), os.Getenv("MI_PASS"),
+        account.WithTokenPath(filepath.Join(home, ".mi.token")))
+    defer acct.Close()
 
-    miio := misgo.NewMiIOService(account, "cn")
-    value, err := miio.MIoTGetProp(ctx, os.Getenv("MI_DID"), misgo.IID{SIID: 2, PIID: 1})
+    value, err := miio.New(acct, "cn").MIoTGetProp(context.Background(), os.Getenv("MI_DID"), miio.IID{SIID: 2, PIID: 1})
     if err != nil {
         log.Fatal(err)
     }
@@ -132,13 +134,14 @@ func main() {
 }
 ```
 
-示例中的 `MI_DID` 应提供实际设备 ID。需要按名称查询、用 CLI 风格解析时，使用 `misgo.Command(ctx, miio, did, text)`。常用入口：
+示例中的 `MI_DID` 应提供实际设备 ID。需要按名称查询、复用 CLI 风格解析时，使用 `miio.New(acct, region).Command(ctx, did, text)`。常用入口：
 
-- `NewMiAccount`：默认在当前目录使用 `.mi.token`；可用 `WithTokenPath`、`WithTokenStore`、`WithOTPCallback`、`WithHTTPClient` 和 `WithLogger` 配置。`Login(ctx, sid)` 可预先建立会话；`MiRequestWith` 支持用重登后的会话重新签名。非交互服务应提供自己的 OTP 回调或传 `nil` 禁用交互。
-- `NewMiIOService`：提供 `DeviceList`、`HomeList`、`MiIORequest`、`HomeRequest`、`MIoTRequest`、属性及动作方法。空区域和 `cn` 都走中国区，其他区域例如 `de`。
-- `NewMiNAService`：提供 `DeviceList`、`TextToSpeech`、`SendMessage`、`Player*`、`PlayByURL`、`PlayByMusicURL` 与 `GetLatestAsk`。库方法使用 MiNA 的 `deviceID`。
-- `NewMiIOLocalService`：提供 `Hello`、`Send`、`GetProp(s)`、`SetProp(s)`；可用 `LocalOptions` 调整 UDP 超时与重试次数。
-- `Spec`、`NewSpecClient` 和 `Decode`：独立使用规格注册表、注入 HTTP 客户端或离线解码。
+- `account.New(username, password, options...)`：默认在当前目录使用 `.mi.token`；可用 `WithTokenPath`、`WithTokenStore`、`WithOTPCallback`、`WithHTTPClient` 和 `WithLogger` 配置。`Login(ctx, sid)` 可预先建立会话；`MiRequestWith` 支持用重登后的会话重新签名；`Request` 发送不附带服务令牌的普通请求。
+- `miio.New(acct, region)`：提供 `DeviceList`、`HomeList`、`Devices`、`Homes`、`MiIORequest`、`HomeRequest`、`MIoTRequest`、`MiIOGetProp(s)`、`MiIOSetProp(s)`、`MIoTGetProp(s)`、`MIoTSetProp`、`MIoTAction`、`Command` 与 `Help`。空区域和 `cn` 都走中国区，其他区域例如 `de`。签名辅助为 `SignNonce`、`SignData`，ID 解析为 `IID`、`ParseIID`。
+- `mina.New(acct)`：提供 `DeviceList`、`TextToSpeech`、`SendMessage`、`Player*`、`PlayByURL`、`PlayByMusicURL` 与 `GetLatestAsk`。库方法使用 MiNA 的 `deviceID`。
+- `local.New(host, token, options...)`：提供 `Hello`、`Send`、`GetProp`、`GetProps`、`SetProp`、`SetProps`、`MIoTGetProp(s)`、`MIoTSetProp(s)`、`MIoTAction`、`Command` 与 `Help`；可用 `Options` 调整 UDP 超时与重试次数。
+- `spec.New(options...)`：提供 `Spec`、`Raw` 与 `Resolve`；可用 `WithBaseURL`、`WithHTTPClient`、`WithIndexCache`、`WithInstanceCache` 配置注册表、客户端与缓存。
+- `miio/decode.Decode` 离线解码；`miio/sign` 提供 `Nonce`、`EncodedNonce` 与 `Data` 签名函数。
 
 ## 许可证
 

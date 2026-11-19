@@ -46,6 +46,13 @@ func run(ctx context.Context, name string, args []string, stdin io.Reader, stdou
 		}
 		args = args[1:]
 	}
+	if len(args) > 0 {
+		switch args[0] {
+		case "version", "--version", "-V":
+			fmt.Fprintf(stdout, "misgo %s\n", Version)
+			return 0
+		}
+	}
 	prefix := name + " "
 	if len(args) == 0 {
 		usage(stdout, prefix)
@@ -142,6 +149,8 @@ func usage(w io.Writer, prefix string) {
 	fmt.Fprint(w, "\nLocal Device (no cloud account, direct LAN control):\n")
 	fmt.Fprint(w, "           export MI_LOCAL=<IP>:<Token>\n\n")
 	fmt.Fprintln(w, local.Help(prefix))
+	fmt.Fprintln(w, "Version:")
+	fmt.Fprintf(w, "           %sversion\n", prefix)
 }
 
 func printResult(w io.Writer, value any) error {

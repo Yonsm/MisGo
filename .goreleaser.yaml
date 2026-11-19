@@ -1,0 +1,36 @@
+version: 2
+
+project_name: misgo
+
+builds:
+  - id: misgo
+    main: ./cmd/misgo
+    binary: misgo
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.Version={{ .Version }}
+
+archives:
+  - id: default
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+
+checksums:
+  name_template: checksums.txt
+
+changelog:
+  disable: true

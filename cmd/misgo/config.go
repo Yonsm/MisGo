@@ -9,7 +9,8 @@ import (
 )
 
 // Version is the MisGo version, independent of the Python MiService version.
-const Version = "0.1.0"
+// Release builds override it with -ldflags "-X main.Version=...".
+var Version = "0.1.1"
 
 // Config holds the MiService environment settings used by the command line.
 // Local takes precedence over cloud settings when it is nonempty.
