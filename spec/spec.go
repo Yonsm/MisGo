@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"net/http"
 	"net/url"
@@ -73,6 +74,7 @@ type Client struct {
 	indexLoad *specIndexLoad
 
 	instMu        sync.Mutex
+	instWriteMu   sync.Mutex
 	instances     map[string]json.RawMessage
 	instanceLoads map[string]*specInstanceLoad
 }
@@ -156,16 +158,25 @@ func (s *Client) rawCached(ctx context.Context, model string) (json.RawMessage, 
 	}
 
 	raw, isInstance, err := s.fetchRaw(ctx, model)
+	needWrite := false
 	s.instMu.Lock()
 	if err == nil && isInstance {
 		s.instances[model] = bytes.Clone(raw)
-		writeJSONCache(s.instanceCachePath, s.instances)
+		needWrite = true
 	}
 	pending.raw, pending.err = raw, err
 	pending.abandoned = err != nil && ctx.Err() != nil
 	delete(s.instanceLoads, model)
 	close(pending.done)
 	s.instMu.Unlock()
+	if needWrite {
+		s.instWriteMu.Lock()
+		s.instMu.Lock()
+		snapshot := maps.Clone(s.instances)
+		s.instMu.Unlock()
+		writeJSONCache(s.instanceCachePath, snapshot)
+		s.instWriteMu.Unlock()
+	}
 	return bytes.Clone(raw), err
 }
 
